@@ -128,6 +128,11 @@ tr:hover{background:rgba(99,102,241,.05)}
 .json-editor-wrap .jsoneditor{height:100%!important}
 .json-editor-wrap .jsoneditor .jsoneditor-outer{height:100%!important}
 .json-editor-wrap .jsoneditor .ace_editor{height:100%!important}
+/* 模型映射分组颜色 */
+tr[data-group]{background:rgba(var(--group-rgb),.07)}
+tr[data-group]:hover{background:rgba(var(--group-rgb),.14)}
+.group-badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:500;background:rgba(var(--group-rgb),.2);color:rgb(var(--group-rgb));gap:6px}
+.group-color-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:rgb(var(--group-rgb));flex-shrink:0}
 </style>
 </head>
 <body>
@@ -536,26 +541,68 @@ async function saveProvider(){
 async function delProvider(id){if(!confirm('确定删除？关联的模型映射也会被删除。'))return;await fetch(API+'/api/providers/'+id,{method:'DELETE'});loadProviders();}
 
 // ---- Models ----
+const GROUP_PALETTE=[
+  '99,102,241','16,185,129','245,158,11','239,68,68','59,130,246','217,70,239',
+  '20,184,166','251,146,60','96,165,250','192,132,252','52,211,153','253,186,116',
+];
+function _groupColor(idx){return GROUP_PALETTE[idx%GROUP_PALETTE.length];}
 async function loadModels(){
   const [models,providers]=await Promise.all([fetch(API+'/api/models').then(r=>r.json()),fetch(API+'/api/providers').then(r=>r.json())]);
   const tb=document.getElementById('models-tbody');
   const empty=document.getElementById('models-empty');
   if(!models.length){tb.innerHTML='';empty.style.display='';return}
   empty.style.display='none';
-  tb.innerHTML=models.map(m=>`<tr>
-    <td><code>${esc(m.alias)}</code></td>
-    <td>${m.group_name?`<code style="color:var(--primary)">${esc(m.group_name)}</code>`:'<span style="color:var(--text2)">-</span>'}</td>
-    <td>${m.priority!=null?`<span class="badge" style="background:var(--primary);color:#fff">${m.priority}</span>`:'<span style="color:var(--text2)">1</span>'}</td>
-    <td><code>${esc(m.target_model)}</code></td>
-    <td>${m.model_type==='multimodal'?'<span class="badge" style="background:#6366f1;color:#fff">多模态</span>':'<span class="badge" style="background:var(--border);color:var(--text)">文本</span>'}</td>
-    <td>${m.max_tokens>0?`<code>${m.max_tokens}</code>`:'<span style="color:var(--text2)">默认</span>'}</td>
-    <td>${esc(m.provider_name||'未知')} <span class="badge badge-${m.provider_type||''}" style="margin-left:4px">${m.provider_type||''}</span></td>
-    <td style="white-space:nowrap"><label class="toggle" title="${m.enabled?'点击禁用':'点击启用'}"><input type="checkbox" ${m.enabled?'checked':''} onchange="toggleModel(${m.id},this.checked)"><span class="toggle-slider"></span></label> <span class="badge ${m.enabled?'badge-success':'badge-error'}" style="margin-left:4px">${m.enabled?'启用':'禁用'}</span></td>
-    <td>
-      <button class="btn btn-sm" style="background:var(--border);color:var(--text)" onclick="editModel(_dataStore.models[${_store('models',m)}])">编辑</button>
-      <button class="btn btn-danger btn-sm" onclick="delModel(${m.id})">删除</button>
-    </td>
-  </tr>`).join('');
+
+  // 按分组排序：有 group_name 的在前面（同 group 排在一起），优先级其次，id 最后
+  const grouped=Object.create(null);
+  let ungrouped=[];
+  for(const m of models){
+    if(m.group_name){
+      if(!grouped[m.group_name])grouped[m.group_name]=[];
+      grouped[m.group_name].push(m);
+    }else{ungrouped.push(m);}
+  }
+  let colorIdx=0;
+  let rows='';
+  for(const gName of Object.keys(grouped).sort()){
+    const color=_groupColor(colorIdx++);
+    const list=grouped[gName].sort((a,b)=>(a.priority||1)-(b.priority||1)||a.id-b.id);
+    for(const m of list){
+      rows+=`<tr data-group="${esc(gName)}" style="--group-rgb:${color}">
+        <td><code>${esc(m.alias)}</code></td>
+        <td><span class="group-badge" style="--group-rgb:${color}"><span class="group-color-dot"></span>${esc(m.group_name)}</span></td>
+        <td>${m.priority!=null?`<span class="badge" style="background:rgba(${color},.35);color:rgb(${color})">${m.priority}</span>`:'<span style="color:var(--text2)">1</span>'}</td>
+        <td><code>${esc(m.target_model)}</code></td>
+        <td>${m.model_type==='multimodal'?'<span class="badge" style="background:#6366f1;color:#fff">多模态</span>':'<span class="badge" style="background:var(--border);color:var(--text)">文本</span>'}</td>
+        <td>${m.max_tokens>0?`<code>${m.max_tokens}</code>`:'<span style="color:var(--text2)">默认</span>'}</td>
+        <td>${esc(m.provider_name||'未知')} <span class="badge badge-${m.provider_type||''}" style="margin-left:4px">${m.provider_type||''}</span></td>
+        <td style="white-space:nowrap"><label class="toggle" title="${m.enabled?'点击禁用':'点击启用'}"><input type="checkbox" ${m.enabled?'checked':''} onchange="toggleModel(${m.id},this.checked)"><span class="toggle-slider"></span></label> <span class="badge ${m.enabled?'badge-success':'badge-error'}" style="margin-left:4px">${m.enabled?'启用':'禁用'}</span></td>
+        <td>
+          <button class="btn btn-sm" style="background:var(--border);color:var(--text)" onclick="editModel(_dataStore.models[${_store('models',m)}])">编辑</button>
+          <button class="btn btn-danger btn-sm" onclick="delModel(${m.id})">删除</button>
+        </td>
+      </tr>`;
+    }
+  }
+  // 无分组的排在最后，灰色
+  const gray='156,163,175';
+  for(const m of ungrouped.sort((a,b)=>a.id-b.id)){
+    rows+=`<tr data-group="" style="--group-rgb:${gray}">
+      <td><code>${esc(m.alias)}</code></td>
+      <td><span style="color:var(--text2)">-</span></td>
+      <td>${m.priority!=null?`<span class="badge" style="background:var(--border);color:var(--text2)">${m.priority}</span>`:'<span style="color:var(--text2)">1</span>'}</td>
+      <td><code>${esc(m.target_model)}</code></td>
+      <td>${m.model_type==='multimodal'?'<span class="badge" style="background:#6366f1;color:#fff">多模态</span>':'<span class="badge" style="background:var(--border);color:var(--text)">文本</span>'}</td>
+      <td>${m.max_tokens>0?`<code>${m.max_tokens}</code>`:'<span style="color:var(--text2)">默认</span>'}</td>
+      <td>${esc(m.provider_name||'未知')} <span class="badge badge-${m.provider_type||''}" style="margin-left:4px">${m.provider_type||''}</span></td>
+      <td style="white-space:nowrap"><label class="toggle" title="${m.enabled?'点击禁用':'点击启用'}"><input type="checkbox" ${m.enabled?'checked':''} onchange="toggleModel(${m.id},this.checked)"><span class="toggle-slider"></span></label> <span class="badge ${m.enabled?'badge-success':'badge-error'}" style="margin-left:4px">${m.enabled?'启用':'禁用'}</span></td>
+      <td>
+        <button class="btn btn-sm" style="background:var(--border);color:var(--text)" onclick="editModel(_dataStore.models[${_store('models',m)}])">编辑</button>
+        <button class="btn btn-danger btn-sm" onclick="delModel(${m.id})">删除</button>
+      </td>
+    </tr>`;
+  }
+  tb.innerHTML=rows;
 }
 async function openModelModal(m){
   const providers=await(await fetch(API+'/api/providers')).json();
