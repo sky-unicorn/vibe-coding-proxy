@@ -129,6 +129,10 @@ _concurrency_semaphores = {}
 _semaphore_capacities = {}
 _concurrency_lock = threading.Lock()
 
+# {provider_id: active_count} 记录每个提供商的活跃请求数（包含无限制提供商）
+_active_requests = {}
+_active_lock = threading.Lock()
+
 
 # ---- 按客户端隔离的加权轮询 ----
 # {(client_ip, group_name): round_robin_index}
@@ -151,20 +155,40 @@ def _get_semaphore(provider_id, max_concurrency):
         return sem
 
 
+def _track_request_start(provider_id):
+    """记录请求开始（递增活跃请求计数）"""
+    with _active_lock:
+        _active_requests[provider_id] = _active_requests.get(provider_id, 0) + 1
+
+
+def _track_request_end(provider_id):
+    """记录请求结束（递减活跃请求计数）"""
+    with _active_lock:
+        count = _active_requests.get(provider_id, 0)
+        if count > 0:
+            _active_requests[provider_id] = count - 1
+        else:
+            _active_requests[provider_id] = 0
+
+
+def _release_concurrency(provider_id, sem=None):
+    """释放并发资源：减少信号量槽位 + 递减活跃请求计数"""
+    if sem:
+        sem.release()
+    _track_request_end(provider_id)
+
+
 def get_concurrency_status():
     """获取所有提供商的并发状态"""
     result = {}
     providers = config.get_providers()
-    with _concurrency_lock:
-        for p in providers:
-            pid = p["id"]
-            max_c = p.get("max_concurrency", 0)
-            sem = _concurrency_semaphores.get(pid)
-            if sem and max_c > 0:
-                used = max(0, max_c - sem._value)
-                result[pid] = {"used": used, "max": max_c, "waiting": 0}
-            else:
-                result[pid] = {"used": 0, "max": max_c, "waiting": 0}
+    with _active_lock:
+        active = dict(_active_requests)
+    for p in providers:
+        pid = p["id"]
+        max_c = p.get("max_concurrency", 0)
+        used = active.get(pid, 0)
+        result[pid] = {"used": used, "max": max_c, "waiting": 0}
     return result
 
 
@@ -302,6 +326,7 @@ def handle_proxy_request(request_body, client_ip=""):
     if sem:
         # 阻塞等待获取信号量，对 Claude Code 来说只是响应慢了
         sem.acquire()
+    _track_request_start(provider_id)
 
     try:
         if provider_type == "anthropic":
@@ -309,11 +334,11 @@ def handle_proxy_request(request_body, client_ip=""):
         elif provider_type == "openai":
             return _proxy_openai(request_body, provider, target_model, stream, sem, client_ip, start_time, model_type, model, model_max_tokens)
         else:
-            if sem: sem.release()
+            _release_concurrency(provider_id, sem)
             return _error_response(f"不支持的提供商类型: {provider_type}", 400)
 
     except Exception as e:
-        if sem: sem.release()
+        _release_concurrency(provider_id, sem)
         duration_ms = int((time.time() - start_time) * 1000)
         if isinstance(e, _CONN_ABORT_ERRORS):
             # 连接级异常：上游断开/超时/DNS解析失败，提供更友好的错误信息
@@ -420,6 +445,7 @@ def handle_openai_proxy_request(request_body, client_ip=""):
     sem = _get_semaphore(provider_id, max_concurrency)
     if sem:
         sem.acquire()
+    _track_request_start(provider_id)
 
     try:
         if provider_type == "openai":
@@ -429,11 +455,11 @@ def handle_openai_proxy_request(request_body, client_ip=""):
             # OpenAI → Anthropic：转换格式
             return _proxy_openai_to_anthropic(request_body, provider, target_model, stream, sem, client_ip, start_time, model_type, model, model_max_tokens)
         else:
-            if sem: sem.release()
+            _release_concurrency(provider_id, sem)
             return _error_response_openai(f"不支持的提供商类型: {provider_type}", 400)
 
     except Exception as e:
-        if sem: sem.release()
+        _release_concurrency(provider_id, sem)
         duration_ms = int((time.time() - start_time) * 1000)
         if isinstance(e, _CONN_ABORT_ERRORS):
             msg = f"连接中断: {type(e).__name__}"
@@ -497,7 +523,7 @@ def _proxy_openai_direct(request_body, provider, target_model, stream, sem=None,
                 _track_usage(provider.get("id", 0), usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
             return json.dumps(resp_json, ensure_ascii=False).encode("utf-8"), mapped_code, {"Content-Type": "application/json"}
         finally:
-            if sem: sem.release()
+            _release_concurrency(provider["id"], sem)
 
 
 def _proxy_openai_to_anthropic(request_body, provider, target_model, stream, sem=None, client_ip="", start_time=None, model_type="text", source_model="", model_max_tokens=0):
@@ -546,7 +572,7 @@ def _proxy_openai_to_anthropic(request_body, provider, target_model, stream, sem
                 _track_usage(provider.get("id", 0), usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0), cache_read_input_tokens, cache_creation_input_tokens)
             return json.dumps(openai_resp, ensure_ascii=False).encode("utf-8"), mapped_code, {"Content-Type": "application/json"}
         finally:
-            if sem: sem.release()
+            _release_concurrency(provider["id"], sem)
 
 
 def _openai_to_anthropic_request(body, target_model, default_max_tokens=4096):
@@ -656,7 +682,7 @@ def _stream_response_openai(url, headers, body, provider, target_model, sem=None
         error_body = resp.text
         resp.close()
         mapped_code = config.get_mapped_code(original_status_code, provider["name"])
-        if sem: sem.release()
+        _release_concurrency(provider["id"], sem)
         config.add_log(
             provider=provider["name"], model=target_model, source_model=source_model,
             input_tokens=0, output_tokens=0,
@@ -703,7 +729,7 @@ def _stream_response_openai(url, headers, body, provider, target_model, sem=None
             error_msg = str(e)
         finally:
             resp.close()
-            if sem: sem.release()
+            _release_concurrency(provider["id"], sem)
             status = "error" if error_msg else "success"
             config.add_log(
                 provider=provider["name"], model=target_model, source_model=source_model,
@@ -730,7 +756,7 @@ def _stream_response_anthropic_to_openai(url, headers, body, provider, target_mo
         error_body = resp.text
         resp.close()
         mapped_code = config.get_mapped_code(original_status_code, provider["name"])
-        if sem: sem.release()
+        _release_concurrency(provider["id"], sem)
         config.add_log(
             provider=provider["name"], model=target_model, source_model=source_model,
             input_tokens=0, output_tokens=0,
@@ -818,7 +844,7 @@ def _stream_response_anthropic_to_openai(url, headers, body, provider, target_mo
             error_msg = str(e)
         finally:
             resp.close()
-            if sem: sem.release()
+            _release_concurrency(provider["id"], sem)
             status = "error" if error_msg else "success"
             config.add_log(
                 provider=provider["name"], model=target_model, source_model=source_model,
@@ -1005,7 +1031,7 @@ def _proxy_anthropic(request_body, provider, target_model, stream, sem=None, cli
                 _track_usage(provider.get("id", 0), input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens)
             return resp.content, mapped_code, {"Content-Type": "application/json"}
         finally:
-            if sem: sem.release()
+            _release_concurrency(provider["id"], sem)
 
 
 def _proxy_openai(request_body, provider, target_model, stream, sem=None, client_ip="", start_time=None, model_type="text", source_model="", model_max_tokens=0):
@@ -1049,7 +1075,7 @@ def _proxy_openai(request_body, provider, target_model, stream, sem=None, client
             content = json.dumps(anthropic_resp, ensure_ascii=False).encode("utf-8")
             return content, mapped_code, {"Content-Type": "application/json"}
         finally:
-            if sem: sem.release()
+            _release_concurrency(provider["id"], sem)
 
 
 # ---- 格式转换: Anthropic → OpenAI ----
@@ -1179,7 +1205,7 @@ def _stream_response(url, headers, body, provider, target_model, provider_type, 
         error_body = resp.text
         resp.close()
         mapped_code = config.get_mapped_code(original_status_code, provider["name"])
-        if sem: sem.release()
+        _release_concurrency(provider["id"], sem)
         config.add_log(
             provider=provider["name"], model=target_model, source_model=source_model,
             input_tokens=0, output_tokens=0,
@@ -1261,7 +1287,7 @@ def _stream_response(url, headers, body, provider, target_model, provider_type, 
             error_msg = str(e)
         finally:
             resp.close()
-            if sem: sem.release()
+            _release_concurrency(provider["id"], sem)
             status = "error" if error_msg else "success"
             config.add_log(
                 provider=provider["name"], model=target_model, source_model=source_model,
