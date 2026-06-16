@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 - AI API Proxy</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0f1117;--card:#1a1d27;--border:#2a2d3a;--text:#e4e4e7;--text2:#9ca3af;--primary:#6366f1;--primary-h:#818cf8;--danger:#ef4444;--success:#22c55e}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center}
+.login-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:36px 32px;width:380px;max-width:90vw}
+.login-card h1{font-size:20px;font-weight:600;text-align:center;margin-bottom:8px}
+.login-card .subtitle{text-align:center;font-size:13px;color:var(--text2);margin-bottom:28px}
+.form-group{margin-bottom:16px}
+.form-group label{display:block;font-size:13px;color:var(--text2);margin-bottom:6px}
+.form-group input{width:100%;padding:10px 12px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:14px;outline:none;transition:border-color .2s}
+.form-group input:focus{border-color:var(--primary)}
+.btn-login{width:100%;padding:10px;border-radius:6px;border:none;background:var(--primary);color:#fff;font-size:14px;font-weight:500;cursor:pointer;transition:background .2s;margin-top:8px}
+.btn-login:hover{background:var(--primary-h)}
+.btn-login:disabled{opacity:.6;cursor:not-allowed}
+.error-msg{display:none;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.3);border-radius:6px;padding:10px 12px;margin-bottom:16px;font-size:13px;color:var(--danger)}
+.error-msg.show{display:block}
+</style>
+</head>
+<body>
+
+<div class="login-card">
+  <h1>AI API Proxy</h1>
+  <p class="subtitle">管理后台登录</p>
+  <div class="error-msg" id="error-msg"></div>
+  <form id="login-form" onsubmit="handleLogin(event)">
+    <div class="form-group">
+      <label for="username">用户名</label>
+      <input type="text" id="username" name="username" placeholder="请输入用户名" autocomplete="username" required>
+    </div>
+    <div class="form-group">
+      <label for="password">密码</label>
+      <input type="password" id="password" name="password" placeholder="请输入密码" autocomplete="current-password" required>
+    </div>
+    <button type="submit" class="btn-login" id="login-btn">登录</button>
+  </form>
+</div>
+
+<script>
+async function checkAuth() {
+  try {
+    const r = await fetch('/api/auth/status');
+    const data = await r.json();
+    if (data.logged_in) {
+      window.location.href = '/';
+    }
+  } catch (e) {}
+}
+
+function showError(msg) {
+  const el = document.getElementById('error-msg');
+  el.textContent = msg;
+  el.classList.add('show');
+}
+
+function hideError() {
+  const el = document.getElementById('error-msg');
+  el.classList.remove('show');
+}
+
+async function handleLogin(e) {
+  e.preventDefault();
+  hideError();
+  const btn = document.getElementById('login-btn');
+  btn.disabled = true;
+  btn.textContent = '登录中...';
+
+  const username = document.getElementById('username').value;
+  const password = document.getElementById('password').value;
+
+  try {
+    const r = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password })
+    });
+    const data = await r.json();
+    if (r.ok && data.ok) {
+      window.location.href = '/';
+    } else {
+      showError(data.error || '登录失败，请检查用户名和密码');
+    }
+  } catch (err) {
+    showError('网络错误，请稍后重试');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '登录';
+  }
+}
+
+checkAuth();
+</script>
+</body>
+</html>
