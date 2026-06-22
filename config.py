@@ -2,6 +2,7 @@ import sqlite3
 import json
 import os
 import secrets
+import threading
 from datetime import datetime, timedelta
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -822,6 +823,35 @@ def cleanup_old_logs(retention_days):
     conn.commit()
     conn.close()
     return deleted
+
+
+# ---- 数据库压缩（VACUUM） ----
+_vacuum_lock = threading.Lock()
+
+
+def vacuum_db():
+    """执行 VACUUM 重建数据库文件，回收被删除日志等遗留的空闲页。
+
+    会获取 EXCLUSIVE 锁，执行期间写请求会短暂等待；建议在后台线程调用。
+    使用 threading.Lock 防止与启动时的 VACUUM 并发。
+    """
+    if not _vacuum_lock.acquire(blocking=False):
+        print("[VACUUM] 已有压缩任务在执行，跳过本次")
+        return False
+    conn = None
+    try:
+        conn = get_conn()
+        conn.execute("VACUUM")
+        conn.commit()
+        print("[VACUUM] 数据库压缩完成")
+        return True
+    except Exception as e:
+        print(f"[VACUUM] 错误: {e}")
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+        _vacuum_lock.release()
 
 
 def get_log_stats():

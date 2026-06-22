@@ -755,8 +755,12 @@ def oauth_token():
 
 # ---- 后台自动清理线程 ----
 
+_last_vacuum_date = None  # 记录上次 VACUUM 的日期，用于每天执行一次
+
+
 def _cleanup_loop():
     """后台线程：按配置间隔自动清理过期日志，并管理计费窗口"""
+    global _last_vacuum_date
     while True:
         try:
             settings = config.get_all_settings()
@@ -786,12 +790,33 @@ def _cleanup_loop():
         except Exception as e:
             print(f"[计费] 错误: {e}")
 
+        # 每天执行一次 VACUUM 压缩数据库（跨天时触发）
+        try:
+            today = _time.strftime("%Y-%m-%d")
+            if _last_vacuum_date != today:
+                _last_vacuum_date = today
+                config.vacuum_db()
+        except Exception as e:
+            print(f"[VACUUM] 错误: {e}")
+
         _time.sleep(interval_hours * 3600)
 
 
 # 启动后台清理线程（daemon 模式，主进程退出时自动结束）
 _cleanup_thread = threading.Thread(target=_cleanup_loop, daemon=True)
 _cleanup_thread.start()
+
+# 启动时在后台执行一次 VACUUM（异步，避免阻塞服务启动）
+def _startup_vacuum():
+    global _last_vacuum_date
+    try:
+        config.vacuum_db()
+        _last_vacuum_date = _time.strftime("%Y-%m-%d")
+    except Exception as e:
+        print(f"[VACUUM] 启动压缩错误: {e}")
+
+_startup_vacuum_thread = threading.Thread(target=_startup_vacuum, daemon=True)
+_startup_vacuum_thread.start()
 
 
 if __name__ == "__main__":
