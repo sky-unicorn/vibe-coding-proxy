@@ -11,22 +11,46 @@ import config
 # 连接级异常：上游断开或客户端断开，属于正常中断，不按业务错误处理
 _CONN_ABORT_ERRORS = (_ReqConnError, ChunkedEncodingError, _ReqTimeout, ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError)
 
+# 重试策略配置：所有请求错误都参与重试，但有耗时与次数上限
+_RETRY_MAX_ATTEMPTS = 3        # 最多重试次数（首次失败后最多再重试 3 次，总请求数 ≤ 4）
+_RETRY_MAX_DURATION = 5.0      # 单次请求耗时上限（秒）：超过则不再重试，避免对已处理很久的错误做无谓重试
+_RETRY_DELAY = 1.0             # 重试间隔（秒）
 
-def _post_with_retry(url, max_retries=1, retry_delay=1.0, **kwargs):
-    """发起 HTTP POST 请求，遇到连接级异常时自动重试一次。
 
-    网络/连接级异常（DNS 失败、连接被上游中止、握手超时）通常为瞬时问题，
-    重试一次有较大概率成功。非连接级异常（HTTP 4xx/5xx、JSON 解析等）不重试。
+def _post_with_retry(url, max_retries=_RETRY_MAX_ATTEMPTS, retry_delay=_RETRY_DELAY, retry_max_duration=_RETRY_MAX_DURATION, **kwargs):
+    """发起 HTTP POST 请求，遇到任何错误时按策略自动重试。
+
+    重试触发条件（需同时满足）：
+      1. 请求出错：连接级异常（DNS 失败 / 连接被上游中止 / 握手超时 / ChunkedEncodingError 等）
+                  或 HTTP 4xx/5xx 错误码；
+      2. 单次请求耗时 < retry_max_duration 秒（上游已处理很久的错误重试代价高，不再重试）；
+      3. 未达到最大重试次数 max_retries。
+
+    该函数内部循环重试，仅返回最终结果（成功响应或最后一次的失败响应/异常），
+    调用方在外层据此只记录一次日志——天然满足"只记录最后一次请求日志"。
     """
     last_err = None
     for attempt in range(max_retries + 1):
+        start = time.time()
         try:
-            return http_requests.post(url, **kwargs)
+            resp = http_requests.post(url, **kwargs)
+            elapsed = time.time() - start
+            # HTTP 4xx/5xx：仅在耗时较短且仍有重试机会时关闭并重试
+            if resp.status_code >= 400 and elapsed < retry_max_duration and attempt < max_retries:
+                resp.close()
+                time.sleep(retry_delay)
+                continue
+            return resp
         except _CONN_ABORT_ERRORS as e:
             last_err = e
-            if attempt < max_retries:
+            elapsed = time.time() - start
+            if elapsed < retry_max_duration and attempt < max_retries:
                 time.sleep(retry_delay)
-    raise last_err
+                continue
+            raise last_err
+    # 理论不可达：最后一次迭代必然走 return 或 raise 分支
+    raise last_err if last_err else RuntimeError("_post_with_retry reached unreachable state")
+
 
 
 _IMAGE_PLACEHOLDER = "[图片内容已省略，当前模型不支持多模态输入]"
