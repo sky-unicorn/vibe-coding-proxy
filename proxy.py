@@ -281,7 +281,17 @@ def handle_proxy_request(request_body, client_ip=""):
         providers = config.get_providers()
         anthropic_providers = [p for p in providers if p["enabled"] and p.get("anthropic_url", "")]
         if anthropic_providers:
-            provider = anthropic_providers[0]
+            # 与 OpenAI fallback 保持一致：显式构造 provider dict，
+            # 避免依赖 get_providers() 的返回字段集合（未来裁剪列时 full_path 不致丢失）
+            p0 = anthropic_providers[0]
+            provider = {
+                "id": p0["id"],
+                "name": p0["name"],
+                "anthropic_url": p0["anthropic_url"],
+                "api_key": p0["api_key"],
+                "max_concurrency": p0.get("max_concurrency", 0),
+                "full_path": p0.get("full_path", 1),
+            }
             target_model = model
         else:
             return _error_response(f"未找到模型 '{model}' 的映射，也没有可用的 Anthropic 提供商", 404)
@@ -304,6 +314,7 @@ def handle_proxy_request(request_body, client_ip=""):
             "anthropic_url": chosen["anthropic_url"],
             "api_key": chosen["api_key"],
             "max_concurrency": chosen.get("provider_max_concurrency", 0),
+            "full_path": chosen.get("full_path", 1),
         }
         target_model = chosen["target_model"]
         model_type = chosen.get("model_type", "text")
@@ -326,6 +337,7 @@ def handle_proxy_request(request_body, client_ip=""):
             "anthropic_url": mapping["anthropic_url"],
             "api_key": mapping["api_key"],
             "max_concurrency": mapping.get("provider_max_concurrency", 0),
+            "full_path": mapping.get("full_path", 1),
         }
         target_model = mapping["target_model"]
         model_type = mapping.get("model_type", "text")
@@ -396,6 +408,7 @@ def handle_openai_proxy_request(request_body, client_ip=""):
                 "openai_url": openai_providers[0]["openai_url"],
                 "api_key": openai_providers[0]["api_key"],
                 "max_concurrency": openai_providers[0].get("max_concurrency", 0),
+                "full_path": openai_providers[0].get("full_path", 1),
             }
             target_model = model
         else:
@@ -419,6 +432,7 @@ def handle_openai_proxy_request(request_body, client_ip=""):
             "openai_url": chosen["openai_url"],
             "api_key": chosen["api_key"],
             "max_concurrency": chosen.get("provider_max_concurrency", 0),
+            "full_path": chosen.get("full_path", 1),
         }
         target_model = chosen["target_model"]
         model_type = chosen.get("model_type", "text")
@@ -441,6 +455,7 @@ def handle_openai_proxy_request(request_body, client_ip=""):
             "openai_url": mapping["openai_url"],
             "api_key": mapping["api_key"],
             "max_concurrency": mapping.get("provider_max_concurrency", 0),
+            "full_path": mapping.get("full_path", 1),
         }
         target_model = mapping["target_model"]
         model_type = mapping.get("model_type", "text")
@@ -492,8 +507,14 @@ def handle_openai_proxy_request(request_body, client_ip=""):
 
 
 def _proxy_openai_direct(request_body, provider, target_model, stream, sem=None, client_ip="", start_time=None, model_type="text", source_model="", model_max_tokens=0):
-    """OpenAI 格式直接转发到 provider 的 openai_url（完整端点地址，不拼接路径）"""
+    """OpenAI 格式直接转发到 provider 的 openai_url。
+
+    full_path=1（默认）：配置的 openai_url 原样使用，不拼接任何后缀。
+    full_path=0：配置的 openai_url 视为 base 路径，自动拼接 /chat/completions。
+    """
     url = provider["openai_url"].rstrip("/")
+    if not provider.get("full_path", 1) and not url.endswith("/chat/completions"):
+        url += "/chat/completions"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {provider['api_key']}",
@@ -694,8 +715,14 @@ def _adapt_minimax_anthropic(body):
 
 
 def _proxy_anthropic(request_body, provider, target_model, stream, sem=None, client_ip="", start_time=None, model_type="text", source_model="", model_max_tokens=0):
-    """直接转发 Anthropic 格式请求到 provider 的 anthropic_url（完整端点地址，不拼接路径）"""
+    """直接转发 Anthropic 格式请求到 provider 的 anthropic_url。
+
+    full_path=1（默认）：配置的 anthropic_url 原样使用，不拼接任何后缀。
+    full_path=0：配置的 anthropic_url 视为 base 路径，自动拼接 /v1/messages。
+    """
     url = provider["anthropic_url"].rstrip("/")
+    if not provider.get("full_path", 1) and not url.endswith("/v1/messages"):
+        url += "/v1/messages"
     headers = {
         "Content-Type": "application/json",
         "x-api-key": provider["api_key"],

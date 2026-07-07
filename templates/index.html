@@ -302,10 +302,15 @@ tr[data-group]:hover{background:rgba(var(--group-rgb),.14)}
     <h3 id="provider-modal-title">添加提供商</h3>
     <input type="hidden" id="provider-edit-id">
     <div class="form-group"><label>名称</label><input id="pf-name" placeholder="如: Anthropic Official"></div>
-    <div class="form-group"><label>Anthropic URL</label><input id="pf-anthropic-url" placeholder="完整端点，如 https://api.anthropic.com/v1/messages （系统不自动拼接路径；留空则不转发 Anthropic 协议请求）"></div>
-    <div class="form-group"><label>OpenAI URL</label><input id="pf-openai-url" placeholder="完整端点，如 https://api.openai.com/v1/chat/completions （系统不自动拼接路径；留空则不转发 OpenAI 协议请求）"></div>
+    <div class="form-group"><label>Anthropic URL</label><input id="pf-anthropic-url" placeholder="完整端点（推荐），如 https://api.anthropic.com/v1/messages。关闭下方「完整路径」开关后可填 base 路径，系统自动拼接 /v1/messages。留空则不转发 Anthropic 协议请求"></div>
+    <div class="form-group"><label>OpenAI URL</label><input id="pf-openai-url" placeholder="完整端点（推荐），如 https://api.openai.com/v1/chat/completions。关闭下方「完整路径」开关后可填 base 路径，系统自动拼接 /chat/completions。留空则不转发 OpenAI 协议请求"></div>
     <div class="form-group"><label>API Key</label><input id="pf-key" type="password" placeholder="sk-ant-..."></div>
     <div class="form-group"><label>最大并行数</label><input id="pf-concurrency" type="number" placeholder="0 = 不限制" min="0" max="100" value="0"><span style="font-size:11px;color:var(--text2);margin-top:2px;display:block">0 表示不限制并发，超过限制的请求将排队等待（不会断开连接）</span></div>
+    <div class="form-group" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <label class="toggle"><input type="checkbox" id="pf-full-path" checked onchange="updateUrlPlaceholders()"><span class="toggle-slider"></span></label>
+      <span style="font-size:13px">完整路径（不自动拼接）</span>
+      <span style="font-size:11px;color:var(--text2);flex:1 1 100%;margin-top:2px">关闭=自动拼接 /v1/messages(Anthropic) 与 /chat/completions(OpenAI)；打开=原样使用</span>
+    </div>
     <div class="form-group" style="display:flex;align-items:center;gap:8px">
       <label class="toggle"><input type="checkbox" id="pf-enabled" checked><span class="toggle-slider"></span></label>
       <span style="font-size:13px">启用</span>
@@ -485,8 +490,8 @@ async function loadProviders(){
     const callCount=st?st.request_count:0;
     return `<tr>
     <td>${esc(p.name)}</td>
-    <td title="${esc(p.anthropic_url||'')}"><code style="font-size:12px">${p.anthropic_url?truncateUrl(p.anthropic_url):'<span style="color:var(--text2)">-</span>'}</code></td>
-    <td title="${esc(p.openai_url||'')}"><code style="font-size:12px">${p.openai_url?truncateUrl(p.openai_url):'<span style="color:var(--text2)">-</span>'}</code></td>
+    <td title="${esc(p.anthropic_url||'')}"><code style="font-size:12px">${p.anthropic_url?truncateUrl(p.anthropic_url):'<span style="color:var(--text2)">-</span>'}</code>${p.anthropic_url?(p.full_path?'<span class="badge badge-success" style="font-size:10px;margin-left:4px">完整</span>':'<span class="badge badge-warn" style="font-size:10px;margin-left:4px">拼接</span>'):''}</td>
+    <td title="${esc(p.openai_url||'')}"><code style="font-size:12px">${p.openai_url?truncateUrl(p.openai_url):'<span style="color:var(--text2)">-</span>'}</code>${p.openai_url?(p.full_path?'<span class="badge badge-success" style="font-size:10px;margin-left:4px">完整</span>':'<span class="badge badge-warn" style="font-size:10px;margin-left:4px">拼接</span>'):''}</td>
     <td><span class="key-mask">${maskKey(p.api_key)}</span></td>
     <td>${maxC>0?maxC:'<span style="color:var(--text2)">-</span>'}</td>
     <td>${concHtml}</td>
@@ -517,8 +522,22 @@ function openProviderModal(p){
   document.getElementById('pf-openai-url').value=p?(p.openai_url||''):'';
   document.getElementById('pf-key').value=p?p.api_key:'';
   document.getElementById('pf-concurrency').value=p?(p.max_concurrency||0):0;
+  document.getElementById('pf-full-path').checked=p?(p.full_path!=null?!!p.full_path:true):true;
   document.getElementById('pf-enabled').checked=p?p.enabled:true;
+  updateUrlPlaceholders();
   document.getElementById('provider-modal').classList.add('active');
+}
+function updateUrlPlaceholders(){
+  const full=document.getElementById('pf-full-path').checked;
+  const anth=document.getElementById('pf-anthropic-url');
+  const oai=document.getElementById('pf-openai-url');
+  if(full){
+    anth.placeholder='完整端点（默认勾选），如 https://api.anthropic.com/v1/messages。系统原样使用，不拼接路径。留空则不转发 Anthropic 协议请求';
+    oai.placeholder='完整端点（默认勾选），如 https://api.openai.com/v1/chat/completions。系统原样使用，不拼接路径。留空则不转发 OpenAI 协议请求';
+  }else{
+    anth.placeholder='base 路径，如 https://api.anthropic.com 或 https://api.anthropic.com/v1。系统自动拼接 /v1/messages。留空则不转发 Anthropic 协议请求';
+    oai.placeholder='base 路径，如 https://api.openai.com 或 https://api.openai.com/v1。系统自动拼接 /chat/completions。留空则不转发 OpenAI 协议请求';
+  }
 }
 function closeProviderModal(){document.getElementById('provider-modal').classList.remove('active')}
 function editProvider(p){openProviderModal(p)}
@@ -530,6 +549,7 @@ async function saveProvider(){
     openai_url:document.getElementById('pf-openai-url').value,
     api_key:document.getElementById('pf-key').value,
     max_concurrency:parseInt(document.getElementById('pf-concurrency').value)||0,
+    full_path:document.getElementById('pf-full-path').checked?1:0,
     enabled:document.getElementById('pf-enabled').checked,
   };
   if(id) await fetch(API+'/api/providers/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});

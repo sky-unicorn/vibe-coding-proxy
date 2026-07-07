@@ -142,6 +142,82 @@ def _migrate_providers_url_to_full_endpoint(conn):
     conn.commit()
 
 
+def _migrate_providers_add_full_path(conn):
+    """为 providers 表添加 full_path 列，用于控制转发时是否自动拼接路径后缀。
+
+    full_path=1（默认，完整路径）：配置的地址原样使用，转发时不拼接任何后缀。
+    full_path=0（base 路径）：转发时自动在 anthropic_url 后拼接 /v1/messages，
+                             在 openai_url 后拼接 /chat/completions。
+
+    迁移策略：对所有历史 provider 一律默认 full_path=1（保留旧「不拼接路径」行为）。
+    旧代码行为是 URL 原样使用、不拼接任何后缀，因此迁移时不按 URL 形态推断为 base 路径，
+    否则非标准自定义端点会被误判为 full_path=0，转发时拼接后缀导致端点不可用。
+    full_path=0 仅作为用户新建/编辑时主动选择的模式。必须在 _migrate_providers_url_to_full_endpoint 之后调用。
+    """
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(providers)").fetchall()]
+    if "full_path" in cols:
+        return  # 已有 full_path 列，无需迁移
+    # 备份子表行数，迁移后做完整性校验（防止外键悬空隐患）
+    mm_count_before = conn.execute("SELECT COUNT(*) FROM model_mappings").fetchone()[0]
+    # 1. 备份现有数据
+    old_rows = conn.execute("SELECT * FROM providers").fetchall()
+    old_col_names = [desc[0] for desc in conn.execute("SELECT * FROM providers LIMIT 0").description]
+    # 2. 删除旧表
+    conn.execute("DROP TABLE providers")
+    # 3. 创建新表（含 full_path 列）
+    conn.execute("""
+        CREATE TABLE providers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            anthropic_url TEXT NOT NULL DEFAULT '',
+            openai_url TEXT NOT NULL DEFAULT '',
+            api_key TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            max_concurrency INTEGER NOT NULL DEFAULT 0,
+            disable_reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            full_path INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    # 4. 回填数据，对所有历史 provider 一律默认 full_path=1（保留旧「不拼接路径」行为）
+    # 旧代码行为是 URL 原样使用、不拼接任何后缀，因此迁移时不应按 URL 形态推断为 base 路径，
+    # 否则非标准自定义端点（如 https://my-proxy.com/api/messages）会被误判为 full_path=0，
+    # 转发时拼接后缀导致端点不可用。full_path=0 仅作为用户新建/编辑时主动选择的模式。
+    if old_rows:
+        for row in old_rows:
+            row_dict = dict(zip(old_col_names, row))
+            # NOT NULL 列兜底，避免历史 NULL 值导致回填失败
+            conn.execute(
+                "INSERT INTO providers (id, name, anthropic_url, openai_url, api_key, enabled, max_concurrency, disable_reason, created_at, full_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row_dict.get("id"),
+                    row_dict.get("name", "") or "",
+                    row_dict.get("anthropic_url", "") or "",
+                    row_dict.get("openai_url", "") or "",
+                    row_dict.get("api_key", "") or "",
+                    int(row_dict.get("enabled") or 1),
+                    int(row_dict.get("max_concurrency") or 0),
+                    row_dict.get("disable_reason") or "",
+                    row_dict.get("created_at") or datetime.now().isoformat(),
+                    1,
+                ),
+            )
+    conn.commit()
+    # 5. 完整性校验：确认子表 model_mappings 无悬空 provider_id（防止迁移后外键失效）
+    mm_count_after = conn.execute("SELECT COUNT(*) FROM model_mappings").fetchone()[0]
+    if mm_count_after != mm_count_before:
+        raise RuntimeError(
+            f"providers 表 full_path 迁移导致 model_mappings 行数变化：{mm_count_before} -> {mm_count_after}"
+        )
+    dangling = conn.execute(
+        "SELECT COUNT(*) FROM model_mappings WHERE provider_id NOT IN (SELECT id FROM providers)"
+    ).fetchone()[0]
+    if dangling:
+        raise RuntimeError(
+            f"providers 表 full_path 迁移后 model_mappings 出现 {dangling} 条悬空 provider_id"
+        )
+
+
 def _migrate_logs_add_source_model(conn):
     """检查 logs 表是否缺少 source_model 列，若缺少则按迁移规则重建表"""
     cols = [row[1] for row in conn.execute("PRAGMA table_info(logs)").fetchall()]
@@ -354,7 +430,8 @@ def init_db():
             enabled INTEGER NOT NULL DEFAULT 1,
             max_concurrency INTEGER NOT NULL DEFAULT 0,
             disable_reason TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            full_path INTEGER NOT NULL DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS model_mappings (
@@ -513,6 +590,7 @@ def init_db():
     _migrate_providers_add_disable_reason(conn)
     _migrate_providers_dual_url(conn)
     _migrate_providers_url_to_full_endpoint(conn)
+    _migrate_providers_add_full_path(conn)
     _drop_legacy_mcp_image_config(conn)
     conn.close()
 
@@ -533,12 +611,12 @@ def get_provider(provider_id):
     return dict(row) if row else None
 
 
-def add_provider(name, anthropic_url="", openai_url="", api_key="", enabled=True, max_concurrency=0):
+def add_provider(name, anthropic_url="", openai_url="", api_key="", enabled=True, max_concurrency=0, full_path=1):
     conn = get_conn()
     c = conn.cursor()
     c.execute(
-        "INSERT INTO providers (name, anthropic_url, openai_url, api_key, enabled, max_concurrency, disable_reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (name, anthropic_url, openai_url, api_key, int(enabled), int(max_concurrency), "", datetime.now().isoformat()),
+        "INSERT INTO providers (name, anthropic_url, openai_url, api_key, enabled, max_concurrency, disable_reason, created_at, full_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (name, anthropic_url, openai_url, api_key, int(enabled), int(max_concurrency), "", datetime.now().isoformat(), int(full_path)),
     )
     conn.commit()
     provider_id = c.lastrowid
@@ -547,13 +625,13 @@ def add_provider(name, anthropic_url="", openai_url="", api_key="", enabled=True
 
 
 def update_provider(provider_id, **kwargs):
-    allowed = {"name", "anthropic_url", "openai_url", "api_key", "enabled", "max_concurrency", "disable_reason"}
+    allowed = {"name", "anthropic_url", "openai_url", "api_key", "enabled", "max_concurrency", "disable_reason", "full_path"}
     fields = []
     values = []
     for k, v in kwargs.items():
         if k in allowed:
             fields.append(f"{k} = ?")
-            values.append(int(v) if k in ("enabled", "max_concurrency") else v)
+            values.append(int(v) if k in ("enabled", "max_concurrency", "full_path") else v)
     # 手动启用时，清除 disable_reason；手动禁用时，标记为 manual
     if "enabled" in kwargs:
         if kwargs["enabled"]:
@@ -600,7 +678,7 @@ def get_model_mapping_by_alias(alias):
     conn = get_conn()
     row = conn.execute(
         "SELECT m.*, p.name as provider_name, p.anthropic_url, p.openai_url, p.api_key, "
-        "p.max_concurrency as provider_max_concurrency "
+        "p.max_concurrency as provider_max_concurrency, p.full_path "
         "FROM model_mappings m LEFT JOIN providers p ON m.provider_id = p.id "
         "WHERE m.alias = ? AND m.enabled = 1 AND p.enabled = 1",
         (alias,),
@@ -612,7 +690,7 @@ def get_model_mapping_by_alias(alias):
     # 没有精确匹配，尝试按 group_name 查找所有匹配项
     rows = conn.execute(
         "SELECT m.*, p.name as provider_name, p.anthropic_url, p.openai_url, p.api_key, "
-        "p.max_concurrency as provider_max_concurrency "
+        "p.max_concurrency as provider_max_concurrency, p.full_path "
         "FROM model_mappings m LEFT JOIN providers p ON m.provider_id = p.id "
         "WHERE m.group_name = ? AND m.enabled = 1 AND p.enabled = 1 "
         "ORDER BY m.priority ASC",

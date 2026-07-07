@@ -278,6 +278,7 @@ def api_add_provider():
         api_key=data["api_key"],
         enabled=data.get("enabled", True),
         max_concurrency=data.get("max_concurrency", 0),
+        full_path=int(data.get("full_path", 1)),
     )
     return jsonify({"id": pid}), 201
 
