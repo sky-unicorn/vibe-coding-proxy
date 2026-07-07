@@ -52,6 +52,96 @@ def _migrate_providers_add_disable_reason(conn):
     conn.commit()
 
 
+def _migrate_providers_dual_url(conn):
+    """将 providers 表从 provider_type/base_url 结构迁移为 anthropic_url/openai_url 结构"""
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(providers)").fetchall()]
+    if "anthropic_url" in cols and "openai_url" in cols:
+        return  # 已是新结构，无需迁移
+
+    # 1. 备份现有数据
+    old_rows = conn.execute("SELECT * FROM providers").fetchall()
+    old_col_names = [desc[0] for desc in conn.execute("SELECT * FROM providers LIMIT 0").description]
+
+    # 2. 删除旧表
+    conn.execute("DROP TABLE providers")
+
+    # 3. 创建新表（同时支持 anthropic_url 与 openai_url）
+    conn.execute("""
+        CREATE TABLE providers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            anthropic_url TEXT NOT NULL DEFAULT '',
+            openai_url TEXT NOT NULL DEFAULT '',
+            api_key TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            max_concurrency INTEGER NOT NULL DEFAULT 0,
+            disable_reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    # 4. 将备份数据按旧 provider_type 映射到新 URL 字段
+    if old_rows:
+        col_to_idx = {name: idx for idx, name in enumerate(old_col_names)}
+        for row in old_rows:
+            row_dict = dict(zip(old_col_names, row))
+            old_base_url = row_dict.get("base_url", "")
+            provider_type = row_dict.get("provider_type", "anthropic")
+            anthropic_url = old_base_url if provider_type == "anthropic" else ""
+            openai_url = old_base_url if provider_type == "openai" else ""
+            conn.execute(
+                """
+                INSERT INTO providers
+                (id, name, anthropic_url, openai_url, api_key, enabled, max_concurrency, disable_reason, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row_dict.get("id"),
+                    row_dict.get("name", ""),
+                    anthropic_url,
+                    openai_url,
+                    row_dict.get("api_key", ""),
+                    row_dict.get("enabled", 1),
+                    row_dict.get("max_concurrency", 0),
+                    row_dict.get("disable_reason", ""),
+                    row_dict.get("created_at", ""),
+                ),
+            )
+    conn.commit()
+
+
+def _migrate_providers_url_to_full_endpoint(conn):
+    """把 providers 的 anthropic_url/openai_url 从 base 路径补全为完整端点地址（一次性迁移）。
+
+    背景：早期代码在转发时会自动拼接 /v1/messages 或 /v1/chat/completions，但许多上游
+    的 base 路径已含版本号（如 ***/v4、***/v2），拼接 /v1/... 会得到 /v4/v1/... 的错误路径。
+    改为不拼接后，需把历史 base 路径补全为完整端点：
+      - anthropic_url（如 .../anthropic）追加 /v1/messages
+      - openai_url（如 .../v4，版本号已在 URL 中）追加 /chat/completions
+    用 PRAGMA user_version 标记确保只执行一次，避免误改用户后续手动填入的非标准端点。
+    """
+    user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if user_version >= 1:
+        return  # 已执行过此迁移
+    rows = conn.execute("SELECT id, anthropic_url, openai_url FROM providers").fetchall()
+    for row in rows:
+        pid = row["id"]
+        anth = (row["anthropic_url"] or "").rstrip("/")
+        oai = (row["openai_url"] or "").rstrip("/")
+        updates = {}
+        # anthropic 端点标准路径为 /v1/messages
+        if anth and not anth.endswith("/v1/messages"):
+            updates["anthropic_url"] = anth + "/v1/messages"
+        # openai 端点：版本号已在 URL 中（如 /v4、/v1），仅追加 /chat/completions
+        if oai and not oai.endswith("/chat/completions"):
+            updates["openai_url"] = oai + "/chat/completions"
+        if updates:
+            sets = ", ".join(f"{k} = ?" for k in updates)
+            conn.execute(f"UPDATE providers SET {sets} WHERE id = ?", (*updates.values(), pid))
+    conn.execute("PRAGMA user_version = 1")
+    conn.commit()
+
+
 def _migrate_logs_add_source_model(conn):
     """检查 logs 表是否缺少 source_model 列，若缺少则按迁移规则重建表"""
     cols = [row[1] for row in conn.execute("PRAGMA table_info(logs)").fetchall()]
@@ -258,9 +348,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS providers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
-            base_url TEXT NOT NULL,
+            anthropic_url TEXT NOT NULL DEFAULT '',
+            openai_url TEXT NOT NULL DEFAULT '',
             api_key TEXT NOT NULL,
-            provider_type TEXT NOT NULL DEFAULT 'anthropic',
             enabled INTEGER NOT NULL DEFAULT 1,
             max_concurrency INTEGER NOT NULL DEFAULT 0,
             disable_reason TEXT NOT NULL DEFAULT '',
@@ -421,6 +511,8 @@ def init_db():
     _migrate_model_mappings(conn)
     _migrate_error_mappings(conn)
     _migrate_providers_add_disable_reason(conn)
+    _migrate_providers_dual_url(conn)
+    _migrate_providers_url_to_full_endpoint(conn)
     _drop_legacy_mcp_image_config(conn)
     conn.close()
 
@@ -441,12 +533,12 @@ def get_provider(provider_id):
     return dict(row) if row else None
 
 
-def add_provider(name, base_url, api_key, provider_type="anthropic", enabled=True, max_concurrency=0):
+def add_provider(name, anthropic_url="", openai_url="", api_key="", enabled=True, max_concurrency=0):
     conn = get_conn()
     c = conn.cursor()
     c.execute(
-        "INSERT INTO providers (name, base_url, api_key, provider_type, enabled, max_concurrency, disable_reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (name, base_url, api_key, provider_type, int(enabled), int(max_concurrency), "", datetime.now().isoformat()),
+        "INSERT INTO providers (name, anthropic_url, openai_url, api_key, enabled, max_concurrency, disable_reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (name, anthropic_url, openai_url, api_key, int(enabled), int(max_concurrency), "", datetime.now().isoformat()),
     )
     conn.commit()
     provider_id = c.lastrowid
@@ -455,7 +547,7 @@ def add_provider(name, base_url, api_key, provider_type="anthropic", enabled=Tru
 
 
 def update_provider(provider_id, **kwargs):
-    allowed = {"name", "base_url", "api_key", "provider_type", "enabled", "max_concurrency", "disable_reason"}
+    allowed = {"name", "anthropic_url", "openai_url", "api_key", "enabled", "max_concurrency", "disable_reason"}
     fields = []
     values = []
     for k, v in kwargs.items():
@@ -496,7 +588,7 @@ def delete_provider(provider_id):
 def get_model_mappings():
     conn = get_conn()
     rows = conn.execute(
-        "SELECT m.*, p.name as provider_name, p.provider_type, p.base_url, p.api_key "
+        "SELECT m.*, p.name as provider_name, p.anthropic_url, p.openai_url, p.api_key "
         "FROM model_mappings m LEFT JOIN providers p ON m.provider_id = p.id "
         "ORDER BY m.group_name ASC, m.priority ASC, m.id ASC"
     ).fetchall()
@@ -507,7 +599,7 @@ def get_model_mappings():
 def get_model_mapping_by_alias(alias):
     conn = get_conn()
     row = conn.execute(
-        "SELECT m.*, p.name as provider_name, p.provider_type, p.base_url, p.api_key, "
+        "SELECT m.*, p.name as provider_name, p.anthropic_url, p.openai_url, p.api_key, "
         "p.max_concurrency as provider_max_concurrency "
         "FROM model_mappings m LEFT JOIN providers p ON m.provider_id = p.id "
         "WHERE m.alias = ? AND m.enabled = 1 AND p.enabled = 1",
@@ -519,7 +611,7 @@ def get_model_mapping_by_alias(alias):
 
     # 没有精确匹配，尝试按 group_name 查找所有匹配项
     rows = conn.execute(
-        "SELECT m.*, p.name as provider_name, p.provider_type, p.base_url, p.api_key, "
+        "SELECT m.*, p.name as provider_name, p.anthropic_url, p.openai_url, p.api_key, "
         "p.max_concurrency as provider_max_concurrency "
         "FROM model_mappings m LEFT JOIN providers p ON m.provider_id = p.id "
         "WHERE m.group_name = ? AND m.enabled = 1 AND p.enabled = 1 "

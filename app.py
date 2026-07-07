@@ -273,9 +273,9 @@ def api_add_provider():
     data = request.get_json(force=True)
     pid = config.add_provider(
         name=data["name"],
-        base_url=data["base_url"],
+        anthropic_url=data.get("anthropic_url", ""),
+        openai_url=data.get("openai_url", ""),
         api_key=data["api_key"],
-        provider_type=data.get("provider_type", "anthropic"),
         enabled=data.get("enabled", True),
         max_concurrency=data.get("max_concurrency", 0),
     )

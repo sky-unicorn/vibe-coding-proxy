@@ -25,11 +25,13 @@
 
 ### 2. 提供商（Provider）管理
 
-- 支持 `anthropic` 与 `openai` 两种 provider 类型，可配置：
-  - 名称、Base URL、API Key、类型
+- 每个 provider 可同时配置 Anthropic URL 与 OpenAI URL 两个地址（至少配置一个）：
+  - 名称、Anthropic URL、OpenAI URL、API Key
   - 启用/禁用（手动或自动）
   - 最大并发数（`max_concurrency`，0 表示不限）
   - "禁用原因"区分（自动禁用时记录原因）
+- 请求转发时按**请求协议**路由到对应的 URL：Anthropic 协议请求（`/anthropic/*`）走 `anthropic_url`，OpenAI 协议请求（`/v1/*`）走 `openai_url`，不做协议格式转换；URL 需填到完整端点（如 `.../v1/messages`、`.../v4/chat/completions`），系统不会自动拼接路径
+- 若某 provider 未配置对应协议的 URL，则该协议的请求会自动排除该 provider（包括模型映射分组与兜底转发）
 - 后台自动统计每个 provider 的实时并发使用量
 
 ### 3. 模型映射（Model Mapping）
@@ -162,9 +164,9 @@ app.run(host="0.0.0.0", port=5000, debug=True)
 | 字段 | 说明 |
 | --- | --- |
 | 名称 | 显示名（例：`AWS Claude`） |
-| Base URL | 上游 API 地址（例：`https://api.anthropic.com`） |
+| Anthropic URL | Anthropic 协议**完整端点地址**（例：`https://api.anthropic.com/v1/messages`），系统不自动拼接路径，留空则不转发 Anthropic 协议请求 |
+| OpenAI URL | OpenAI 协议**完整端点地址**（例：`https://api.openai.com/v1/chat/completions`），系统不自动拼接路径，留空则不转发 OpenAI 协议请求 |
 | API Key | 上游 Key |
-| 类型 | `anthropic` 或 `openai` |
 | 最大并发 | 0 = 不限；N = 同时最多 N 个请求 |
 
 ### 3. 创建 API Key
