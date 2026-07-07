@@ -332,6 +332,7 @@ def api_add_model():
         priority=data.get("priority", 1),
         model_type=data.get("model_type", "text"),
         max_tokens=data.get("max_tokens", 0),
+        role_mappings=data.get("role_mappings", "[]"),
     )
     return jsonify({"id": mid}), 201
 

@@ -138,6 +138,58 @@ def _strip_images_openai(body):
             msg["content"] = new_content
 
 
+def _role_replace_rules(mapping):
+    """从模型映射 dict 中提取角色替换规则列表，返回 list[dict]，每项形如 {"from":..., "to":...}。
+
+    role_mappings 在数据库中存为 JSON 字符串数组；非法或空时返回 []。
+    """
+    if not mapping:
+        return []
+    raw = mapping.get("role_mappings", "[]")
+    if not raw:
+        return []
+    if isinstance(raw, (list, tuple)):
+        data = raw
+    else:
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return []
+    rules = []
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                rf = item.get("from") or item.get("role_from")
+                rt = item.get("to") or item.get("role_to")
+                if rf and rt and rf != rt:
+                    rules.append({"from": rf, "to": rt})
+    return rules
+
+
+def _apply_role_replacement(body, rules):
+    """按 rules 列表依次替换请求体 messages 中的角色。
+
+    rules 为 list[dict]，每项 {"from": 原角色, "to": 目标角色}。
+    对 OpenAI（/v1、/openai/responses）和 Anthropic（/anthropic）链路均适用。
+    注意：按列表顺序应用，先替换的结果会被后续规则再次处理（如需避免链式替换可一次性映射）。
+    """
+    if not rules:
+        return
+    # 一次性映射：相同原角色只取第一条规则，避免链式替换（A→B, B→C 把 A 变成 C）
+    mapping_table = {}
+    for r in rules:
+        f, t = r.get("from"), r.get("to")
+        if f and t and f != t and f not in mapping_table:
+            mapping_table[f] = t
+    if not mapping_table:
+        return
+    for msg in body.get("messages", []):
+        if isinstance(msg, dict):
+            new_role = mapping_table.get(msg.get("role"))
+            if new_role:
+                msg["role"] = new_role
+
+
 def _track_usage(provider_id, input_tokens, output_tokens, cache_read_input_tokens=0, cache_creation_input_tokens=0):
     """Record billing usage. Failure must not affect the response."""
     try:
@@ -276,6 +328,7 @@ def handle_proxy_request(request_body, client_ip=""):
 
     # 查找模型映射
     mapping = config.get_model_mapping_by_alias(model)
+    role_rules = []
     if not mapping:
         # 没有映射，尝试找默认的 anthropic provider 直接转发
         providers = config.get_providers()
@@ -319,6 +372,7 @@ def handle_proxy_request(request_body, client_ip=""):
         target_model = chosen["target_model"]
         model_type = chosen.get("model_type", "text")
         model_max_tokens = chosen.get("max_tokens", 0)
+        role_rules = _role_replace_rules(chosen)
     else:
         # 单个精确匹配：如果请求含图片但模型不是多模态，尝试从同 group 中找多模态替代
         if _has_images_anthropic(request_body) and mapping.get("model_type") != "multimodal":
@@ -342,6 +396,7 @@ def handle_proxy_request(request_body, client_ip=""):
         target_model = mapping["target_model"]
         model_type = mapping.get("model_type", "text")
         model_max_tokens = mapping.get("max_tokens", 0)
+        role_rules = _role_replace_rules(mapping)
 
     start_time = time.time()
     provider_id = provider.get("id", 0)
@@ -365,7 +420,7 @@ def handle_proxy_request(request_body, client_ip=""):
     _track_request_start(provider_id)
 
     try:
-        return _proxy_anthropic(request_body, provider, target_model, stream, sem, client_ip, start_time, model_type, model, model_max_tokens)
+        return _proxy_anthropic(request_body, provider, target_model, stream, sem, client_ip, start_time, model_type, model, model_max_tokens, role_rules)
 
     except Exception as e:
         _release_concurrency(provider_id, sem)
@@ -394,8 +449,10 @@ def handle_proxy_request(request_body, client_ip=""):
 def _resolve_openai_provider(request_body, client_ip=""):
     """解析 OpenAI 协议请求的 provider / 目标模型（Chat Completions 与 Responses 入口共用）。
 
-    返回 (provider, target_model, model_type, model_max_tokens) 或
-    (None, error_message, None, None) 表示解析失败（调用方按自身错误格式包装）。
+    返回 (provider, target_model, model_type, model_max_tokens, role_rules) 或
+    (None, error_message, None, None, None) 表示解析失败（调用方按自身错误格式包装）。
+    其中 role_rules 是命中的模型映射的「角色映射」规则列表（list[dict]，可能为空）；
+    fallback（无映射）场景为 [] 表示不做替换。
     解析规则与原 handle_openai_proxy_request 完全一致：
       - 别名无映射 → 取首个配置了 openai_url 的启用 provider 作兜底
       - 别名命中 group → 过滤 openai_url + 计费可用项，加权轮询，含图片时优先多模态
@@ -415,13 +472,13 @@ def _resolve_openai_provider(request_body, client_ip=""):
                 "max_concurrency": openai_providers[0].get("max_concurrency", 0),
                 "full_path": openai_providers[0].get("full_path", 1),
             }
-            return provider, model, "text", 0
-        return None, f"未找到模型 '{model}' 的映射，也没有可用的 OpenAI 提供商", None, None
+            return provider, model, "text", 0, []
+        return None, f"未找到模型 '{model}' 的映射，也没有可用的 OpenAI 提供商", None, None, None
     elif isinstance(mapping, list):
         # group 匹配：过滤掉没有 openai_url 或计费超限的提供商，再按优先级加权轮询
         available = [m for m in mapping if m.get("openai_url", "") and config.check_provider_billing(m["provider_id"])["allowed"]]
         if not available:
-            return None, f"模型 '{model}' 的所有可用 OpenAI 提供商均已超限或不可用", None, None
+            return None, f"模型 '{model}' 的所有可用 OpenAI 提供商均已超限或不可用", None, None, None
         # 请求含图片时，优先选择多模态模型；无多模态候选项则回退到全部候选项
         if _has_images_openai(request_body):
             multimodal = [m for m in available if m.get("model_type") == "multimodal"]
@@ -436,7 +493,8 @@ def _resolve_openai_provider(request_body, client_ip=""):
             "max_concurrency": chosen.get("provider_max_concurrency", 0),
             "full_path": chosen.get("full_path", 1),
         }
-        return provider, chosen["target_model"], chosen.get("model_type", "text"), chosen.get("max_tokens", 0)
+        return (provider, chosen["target_model"], chosen.get("model_type", "text"), chosen.get("max_tokens", 0),
+                _role_replace_rules(chosen))
     else:
         # 单个精确匹配：如果请求含图片但模型不是多模态，尝试从同 group 中找多模态替代
         if _has_images_openai(request_body) and mapping.get("model_type") != "multimodal":
@@ -448,7 +506,7 @@ def _resolve_openai_provider(request_body, client_ip=""):
                 if multimodal:
                     mapping = multimodal[0]
         if not mapping.get("openai_url", ""):
-            return None, f"模型 '{model}' 的提供商未配置 OpenAI URL", None, None
+            return None, f"模型 '{model}' 的提供商未配置 OpenAI URL", None, None, None
         provider = {
             "id": mapping["provider_id"],
             "name": mapping["provider_name"],
@@ -457,7 +515,8 @@ def _resolve_openai_provider(request_body, client_ip=""):
             "max_concurrency": mapping.get("provider_max_concurrency", 0),
             "full_path": mapping.get("full_path", 1),
         }
-        return provider, mapping["target_model"], mapping.get("model_type", "text"), mapping.get("max_tokens", 0)
+        return (provider, mapping["target_model"], mapping.get("model_type", "text"), mapping.get("max_tokens", 0),
+                _role_replace_rules(mapping))
 
 
 def handle_openai_proxy_request(request_body, client_ip=""):
@@ -466,7 +525,7 @@ def handle_openai_proxy_request(request_body, client_ip=""):
     stream = request_body.get("stream", False)
 
     # 解析 provider / 目标模型（与 Responses 入口共用同一套逻辑）
-    provider, target_model, model_type, model_max_tokens = _resolve_openai_provider(request_body, client_ip)
+    provider, target_model, model_type, model_max_tokens, role_rules = _resolve_openai_provider(request_body, client_ip)
     if provider is None:
         return _error_response_openai(target_model, 404 if "未找到" in target_model or "未配置" in target_model else 429)
 
@@ -490,7 +549,7 @@ def handle_openai_proxy_request(request_body, client_ip=""):
 
     try:
         # OpenAI → OpenAI：直接转发到 openai_url
-        return _proxy_openai_direct(request_body, provider, target_model, stream, sem, client_ip, start_time, model_type, model, model_max_tokens)
+        return _proxy_openai_direct(request_body, provider, target_model, stream, sem, client_ip, start_time, model_type, model, model_max_tokens, role_rules)
 
     except Exception as e:
         _release_concurrency(provider_id, sem)
@@ -515,11 +574,14 @@ def handle_openai_proxy_request(request_body, client_ip=""):
         return _error_response_openai(str(e), 502)
 
 
-def _proxy_openai_direct(request_body, provider, target_model, stream, sem=None, client_ip="", start_time=None, model_type="text", source_model="", model_max_tokens=0):
+def _proxy_openai_direct(request_body, provider, target_model, stream, sem=None, client_ip="", start_time=None, model_type="text", source_model="", model_max_tokens=0, role_rules=None):
     """OpenAI 格式直接转发到 provider 的 openai_url。
 
     full_path=1（默认）：配置的 openai_url 原样使用，不拼接任何后缀。
     full_path=0：配置的 openai_url 视为 base 路径，自动拼接 /chat/completions。
+
+    role_rules: 来自模型映射的角色替换规则列表（如 developer→system），
+                仅对当前 mapping 生效，在转发前应用到 messages。
     """
     url = provider["openai_url"].rstrip("/")
     if not provider.get("full_path", 1) and not url.endswith("/chat/completions"):
@@ -530,6 +592,9 @@ def _proxy_openai_direct(request_body, provider, target_model, stream, sem=None,
     }
     body = dict(request_body)
     body["model"] = target_model
+
+    # 应用模型映射配置的角色替换（只对当前提供商/模型生效）
+    _apply_role_replacement(body, role_rules)
 
     # 文本模型需替换图片内容为文本提示，多模态模型保留图片
     if model_type != "multimodal":
@@ -723,11 +788,14 @@ def _adapt_minimax_anthropic(body):
     ]
 
 
-def _proxy_anthropic(request_body, provider, target_model, stream, sem=None, client_ip="", start_time=None, model_type="text", source_model="", model_max_tokens=0):
+def _proxy_anthropic(request_body, provider, target_model, stream, sem=None, client_ip="", start_time=None, model_type="text", source_model="", model_max_tokens=0, role_rules=None):
     """直接转发 Anthropic 格式请求到 provider 的 anthropic_url。
 
     full_path=1（默认）：配置的 anthropic_url 原样使用，不拼接任何后缀。
     full_path=0：配置的 anthropic_url 视为 base 路径，自动拼接 /v1/messages。
+
+    role_rules: 来自模型映射的角色替换规则列表，在 system 提取前应用到 messages，
+                使 developer→system 等替换结果能被正确归入顶层 system 字段。
     """
     url = provider["anthropic_url"].rstrip("/")
     if not provider.get("full_path", 1) and not url.endswith("/v1/messages"):
@@ -739,6 +807,9 @@ def _proxy_anthropic(request_body, provider, target_model, stream, sem=None, cli
     }
     body = {k: v for k, v in request_body.items() if not k.startswith("_")}
     body["model"] = target_model
+
+    # 应用模型映射配置的角色替换（必须在 system 提取前执行）
+    _apply_role_replacement(body, role_rules)
 
     # 将 messages 中 role=system 的消息提取到 system 字段（Anthropic 要求 system 在顶层字段）
     system_messages = [m for m in body.get("messages", []) if m.get("role") == "system"]
@@ -1056,6 +1127,9 @@ def _responses_input_to_chat_messages(input_val, instructions=None):
                 messages.append({"role": "assistant", "tool_calls": pending_tool_calls})
                 pending_tool_calls = []
 
+            # 保留原始 role（含 system / user / assistant / developer 等）。
+            # developer 等不兼容角色的归一化由模型映射的「角色映射」配置在转发层统一处理，
+            # 这样将来上游恢复支持时无需改代码，只需在 UI 关闭替换即可。
             role = item.get("role", "user")
             content = item.get("content", "")
 
@@ -1581,9 +1655,13 @@ def handle_openai_responses_request(request_body, client_ip=""):
         return _error_response_responses("input 字段不能为空", 400)
 
     # 复用 provider 解析逻辑（以转换后的 chat_body 作为请求体，保证图片检测正确）
-    provider, target_model, model_type, model_max_tokens = _resolve_openai_provider(chat_body, client_ip)
+    provider, target_model, model_type, model_max_tokens, role_rules = _resolve_openai_provider(chat_body, client_ip)
     if provider is None:
         return _error_response_responses(target_model, 404 if "未找到" in target_model or "未配置" in target_model else 429)
+
+    # 应用模型映射配置的角色替换（developer→system 等，仅对当前 mapping 生效）
+    # 统一在 chat_body 上做一次，后续流式/非流式分支均复用
+    _apply_role_replacement(chat_body, role_rules)
 
     start_time = time.time()
     provider_id = provider.get("id", 0)

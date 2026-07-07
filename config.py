@@ -370,16 +370,16 @@ def _migrate_error_mappings(conn):
 
 
 def _migrate_model_mappings(conn):
-    """检查 model_mappings 表是否缺少列，若缺少则按迁移规则重建表"""
+    """检查 model_mappings 表是否有 role_mappings 列，若缺少则按迁移规则重建表"""
     cols = [row[1] for row in conn.execute("PRAGMA table_info(model_mappings)").fetchall()]
-    if "priority" in cols and "model_type" in cols and "max_tokens" in cols:
-        return  # 已有所有列，无需迁移
+    if "role_mappings" in cols:
+        return  # 已有新结构，无需迁移
     # 1. 备份现有数据
     old_rows = conn.execute("SELECT * FROM model_mappings").fetchall()
     old_col_names = [desc[0] for desc in conn.execute("SELECT * FROM model_mappings LIMIT 1").description] if old_rows else []
     # 2. 删除旧表
     conn.execute("DROP TABLE model_mappings")
-    # 3. 创建新表（含 priority、model_type、max_tokens 列）
+    # 3. 创建新表（角色映射统一用 JSON 数组存储，支持多条规则）
     conn.execute("""
         CREATE TABLE model_mappings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -391,6 +391,7 @@ def _migrate_model_mappings(conn):
             model_type TEXT NOT NULL DEFAULT 'text',
             max_tokens INTEGER NOT NULL DEFAULT 0,
             enabled INTEGER NOT NULL DEFAULT 1,
+            role_mappings TEXT NOT NULL DEFAULT '[]',
             FOREIGN KEY (provider_id) REFERENCES providers(id)
         )
     """)
@@ -400,8 +401,13 @@ def _migrate_model_mappings(conn):
         has_max_tokens = "max_tokens" in old_col_names
         for row in old_rows:
             row_dict = dict(zip(old_col_names, row))
+            # 兼容旧版单条角色映射（role_replace_enabled/role_from/role_to）→ 转 JSON 数组
+            rules = []
+            if row_dict.get("role_replace_enabled") and row_dict.get("role_from") and row_dict.get("role_to"):
+                rules.append({"from": row_dict["role_from"], "to": row_dict["role_to"]})
+            role_mappings = json.dumps(rules, ensure_ascii=False)
             conn.execute(
-                "INSERT INTO model_mappings (id, alias, target_model, provider_id, group_name, priority, model_type, max_tokens, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO model_mappings (id, alias, target_model, provider_id, group_name, priority, model_type, max_tokens, enabled, role_mappings) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     row_dict["id"],
                     row_dict["alias"],
@@ -412,6 +418,7 @@ def _migrate_model_mappings(conn):
                     row_dict.get("model_type", "text"),
                     row_dict.get("max_tokens", 0) if has_max_tokens else 0,
                     row_dict.get("enabled", 1),
+                    role_mappings,
                 ),
             )
     conn.commit()
@@ -444,6 +451,7 @@ def init_db():
             model_type TEXT NOT NULL DEFAULT 'text',
             max_tokens INTEGER NOT NULL DEFAULT 0,
             enabled INTEGER NOT NULL DEFAULT 1,
+            role_mappings TEXT NOT NULL DEFAULT '[]',
             FOREIGN KEY (provider_id) REFERENCES providers(id)
         );
 
@@ -702,12 +710,16 @@ def get_model_mapping_by_alias(alias):
     return [dict(r) for r in rows]
 
 
-def add_model_mapping(alias, target_model, provider_id, enabled=True, group_name="", priority=1, model_type="text", max_tokens=0):
+def add_model_mapping(alias, target_model, provider_id, enabled=True, group_name="", priority=1, model_type="text", max_tokens=0, role_mappings=None):
     conn = get_conn()
     c = conn.cursor()
+    if role_mappings is None:
+        role_mappings = "[]"
+    elif isinstance(role_mappings, (list, dict)):
+        role_mappings = json.dumps(role_mappings, ensure_ascii=False)
     c.execute(
-        "INSERT INTO model_mappings (alias, target_model, provider_id, group_name, priority, model_type, max_tokens, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (alias, target_model, provider_id, group_name, int(priority), model_type, int(max_tokens), int(enabled)),
+        "INSERT INTO model_mappings (alias, target_model, provider_id, group_name, priority, model_type, max_tokens, enabled, role_mappings) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (alias, target_model, provider_id, group_name, int(priority), model_type, int(max_tokens), int(enabled), role_mappings),
     )
     conn.commit()
     mapping_id = c.lastrowid
@@ -716,13 +728,19 @@ def add_model_mapping(alias, target_model, provider_id, enabled=True, group_name
 
 
 def update_model_mapping(mapping_id, **kwargs):
-    allowed = {"alias", "target_model", "provider_id", "enabled", "group_name", "priority", "model_type", "max_tokens"}
+    allowed = {"alias", "target_model", "provider_id", "enabled", "group_name", "priority", "model_type", "max_tokens", "role_mappings"}
     fields = []
     values = []
     for k, v in kwargs.items():
         if k in allowed:
             fields.append(f"{k} = ?")
-            values.append(int(v) if k in ("enabled", "priority", "max_tokens") else v)
+            if k == "role_mappings":
+                # 允许传 list/dict 或已序列化的 JSON 字符串
+                if isinstance(v, (list, dict)):
+                    v = json.dumps(v, ensure_ascii=False)
+                values.append(v)
+            else:
+                values.append(int(v) if k in ("enabled", "priority", "max_tokens") else v)
     if not fields:
         return
     values.append(mapping_id)
