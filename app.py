@@ -822,7 +822,7 @@ _startup_vacuum_thread.start()
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("  AI API Proxy 已启动")
+    print("  Vibe Coding 服务转发 已启动")
     print("  Web 管理界面:  http://localhost:5000")
     print("  Anthropic 代理: http://localhost:5000/anthropic")
     print("  OpenAI 代理:    http://localhost:5000/v1")
