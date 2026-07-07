@@ -23,7 +23,7 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 # ---- 认证中间件 ----
 
 # 不需要登录就能访问的路由前缀
-_PUBLIC_PREFIXES = ("/anthropic", "/v1", "/oauth", "/.well-known")
+_PUBLIC_PREFIXES = ("/anthropic", "/v1", "/openai", "/oauth", "/.well-known")
 # 登录相关路由
 _AUTH_ROUTES = ("/api/auth/login",)
 
@@ -76,8 +76,8 @@ def _check_api_key():
                 api_key = auth[7:]
         if not config.validate_api_key(api_key):
             return jsonify({"error": "无效的 API Key"}), 401
-    elif path.startswith("/v1"):
-        # OpenAI: Authorization: Bearer sk-xxx
+    elif path.startswith("/v1") or path.startswith("/openai"):
+        # OpenAI Chat Completions (/v1) 与 Responses (/openai): Authorization: Bearer sk-xxx
         auth = request.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
             api_key = auth[7:]
@@ -231,10 +231,9 @@ def anthropic_proxy(path):
     stream = body.get("stream", False)
     content, status_code, headers = proxy.handle_proxy_request(body, client_ip)
 
-    if stream and callable(content):
-        return Response(content(), status=status_code, headers=headers)
-    else:
-        return Response(content, status=status_code, headers=headers)
+    # 流式响应时 content 是 generator；Flask Response 对 generator 和 bytes/str 都能正确处理，
+    # 按类型统一传入即可，不再用 callable(content) 判断（生成器对象不可调用）。
+    return Response(content, status=status_code, headers=headers)
 
 
 # ---- OpenAI Chat Completions API 代理 ----
@@ -255,10 +254,28 @@ def openai_proxy(path):
     stream = body.get("stream", False)
     content, status_code, headers = proxy.handle_openai_proxy_request(body, client_ip)
 
-    if stream and callable(content):
-        return Response(content(), status=status_code, headers=headers)
-    else:
-        return Response(content, status=status_code, headers=headers)
+    # 流式响应时 content 是 generator；Flask Response 对 generator 和 bytes/str 都能正确处理，
+    # 按类型统一传入即可，不再用 callable(content) 判断（生成器对象不可调用）。
+    return Response(content, status=status_code, headers=headers)
+
+
+# ---- OpenAI Responses API 代理 ----
+
+@app.route("/openai/responses", methods=["POST"])
+def openai_responses_proxy():
+    """OpenAI Responses API 端点，内部转换为 Chat Completions 格式转发到 openai_url"""
+    try:
+        body = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": {"type": "invalid_request", "message": "无效的 JSON 请求"}}), 400
+
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip()
+    stream = body.get("stream", False)
+    content, status_code, headers = proxy.handle_openai_responses_request(body, client_ip)
+
+    # 流式响应时 content 是 generator；Flask Response 对 generator 和 bytes/str 都能正确处理，
+    # 按类型统一传入即可，不再用 callable(content) 判断（生成器对象不可调用）。
+    return Response(content, status=status_code, headers=headers)
 
 
 # ---- Providers API ----
@@ -826,5 +843,6 @@ if __name__ == "__main__":
     print("  Web 管理界面:  http://localhost:5000")
     print("  Anthropic 代理: http://localhost:5000/anthropic")
     print("  OpenAI 代理:    http://localhost:5000/v1")
+    print("  Responses 代理: http://localhost:5000/openai/responses")
     print("=" * 50)
     app.run(host="0.0.0.0", port=5000, debug=True)

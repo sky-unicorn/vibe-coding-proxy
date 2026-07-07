@@ -20,6 +20,7 @@
 
 - `POST /anthropic/v1/messages`（及子路径）— Anthropic Messages API 透传
 - `POST /v1/chat/completions`（及子路径）— OpenAI Chat Completions 透传
+- `POST /openai/responses` — OpenAI **Responses API** 端点，供 Codex CLI 等只认 Responses 协议的客户端使用；本服务会自动把 Responses 请求转换为 Chat Completions 格式，转发到对应 provider 的 `openai_url`，再把上游的 Chat 响应转回 Responses 格式（同时支持 `stream: true` 的 SSE 与 `stream: false` 的整包返回）
 - 支持流式响应（`stream: true`）
 - 支持从请求体中读取 `x-api-key` 或 `Authorization: Bearer ...`
 
@@ -228,6 +229,35 @@ export ANTHROPIC_AUTH_TOKEN=sk-你的Key
 ```bash
 export OPENAI_BASE_URL=http://localhost:5000/v1
 export OPENAI_API_KEY=sk-你的Key
+```
+
+#### 接入 Codex CLI
+
+Codex CLI 使用 OpenAI **Responses API**（`/v1/responses`），而非 Chat Completions。本服务提供 `POST /openai/responses` 端点，自动完成 Responses 与 Chat Completions 之间的双向格式转换，无需上游支持 Responses 协议。
+
+配置方法：
+
+```bash
+export OPENAI_BASE_URL=http://localhost:5000/openai
+export OPENAI_API_KEY=sk-你的Key
+```
+
+Codex CLI 会自动请求 `OPENAI_BASE_URL/responses`（即 `http://localhost:5000/openai/responses`），本服务接收后：
+1. 将 Responses 格式请求（`input` / `instructions` 等）转换为 Chat Completions 格式（`messages` / `system` 等）
+2. 转发到对应 provider 的 `openai_url`
+3. 将上游返回的 Chat Completions 响应转换回 Responses 格式返回
+
+也可直接用 curl 测试：
+
+```bash
+curl -X POST http://localhost:5000/openai/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-你的Key" \
+  -d '{
+    "model": "claude-sonnet-4",
+    "input": "你好",
+    "stream": false
+  }'
 ```
 
 ### 6. 错误码映射示例
