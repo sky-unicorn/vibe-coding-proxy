@@ -142,7 +142,8 @@ tr[data-group]:hover{background:rgba(var(--group-rgb),.14)}
   <div style="display:flex;align-items:center;gap:12px">
     <div class="url-bar">
       <div class="url-item"><span class="url-label anthropic">Anthropic</span> <code id="url-anthropic"></code> <button class="copy-btn" onclick="copyUrl('url-anthropic')">复制</button></div>
-      <div class="url-item"><span class="url-label openai">OpenAI</span> <code id="url-openai"></code> <button class="copy-btn" onclick="copyUrl('url-openai')">复制</button></div>
+      <div class="url-item"><span class="url-label openai">OpenAiChat</span> <code id="url-openai-chat"></code> <button class="copy-btn" onclick="copyUrl('url-openai-chat')">复制</button></div>
+      <div class="url-item"><span class="url-label openai">OpenAiResponses</span> <code id="url-openai-responses"></code> <button class="copy-btn" onclick="copyUrl('url-openai-responses')">复制</button></div>
     </div>
     <button class="btn btn-danger btn-sm" onclick="logout()">登出</button>
   </div>
@@ -1186,7 +1187,8 @@ async function logout(){await fetch(API+'/api/auth/logout',{method:'POST'});wind
 function initUrls(){
   const base=location.origin;
   document.getElementById('url-anthropic').textContent=base+'/anthropic';
-  document.getElementById('url-openai').textContent=base+'/v1';
+  document.getElementById('url-openai-chat').textContent=base+'/v1';
+  document.getElementById('url-openai-responses').textContent=base+'/openai';
 }
 
 // Init

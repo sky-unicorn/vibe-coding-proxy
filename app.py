@@ -844,6 +844,6 @@ if __name__ == "__main__":
     print("  Web 管理界面:  http://localhost:5000")
     print("  Anthropic 代理: http://localhost:5000/anthropic")
     print("  OpenAI 代理:    http://localhost:5000/v1")
-    print("  Responses 代理: http://localhost:5000/openai/responses")
+    print("  Responses 代理: http://localhost:5000/openai")
     print("=" * 50)
     app.run(host="0.0.0.0", port=5000, debug=True)
