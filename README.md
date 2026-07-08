@@ -1,16 +1,19 @@
 # Vibe Coding 服务转发
 
-一个基于 Flask 的多供应商 AI API 代理服务，统一对外暴露 Anthropic Messages API 与 OpenAI Chat Completions API 两种接口，底层可对接任意兼容的 LLM 提供商。配套 Web 管理界面，可对提供商、模型映射、错误码、日志、计费、API Key 等进行可视化配置。
+一个基于 Flask 的多供应商 AI API 代理服务，统一对外暴露 **Anthropic Messages API**、**OpenAI Chat Completions API**、**OpenAI Responses API** 三种接口，底层可对接任意兼容的 LLM 提供商。配套 Web 管理界面，可对提供商、模型映射（含角色映射）、错误码、日志、计费、API Key、OAuth 客户端等进行可视化配置。
 
 ---
 
 ## 一、项目作用
 
 - **统一代理入口**：把多家上游 LLM（Anthropic 官方、自建网关、OpenAI 兼容服务等）抽象成统一的 Anthropic / OpenAI 接口，下游客户端无需关心上游差异。
-- **模型路由**：按客户端请求的 `model` 字段（别名）路由到真实的目标模型和提供商，支持多候选分组、加权轮询、自动跳过超限节点。
+- **模型路由**：按客户端请求的 `model` 字段（别名）路由到真实的目标模型和提供商，支持多候选分组、按客户端 IP 隔离的加权轮询、自动选并发最低的节点。
+- **请求改写**：支持在转发前进行**角色映射**（如 `developer → system`）、强制覆盖 `max_tokens`、系统消息归入顶层字段等改写，解决不同客户端与上游协议的细微差异。
 - **资源治理**：内置并发限流、错误码映射、计费限额（5h / 周 / 月 / 余额）以及自动日志清理，避免某个提供商被滥用或意外超支。
-- **可观测性**：完整记录每次请求的时间、IP、模型、token、耗时、状态码、请求/响应体，便于排查问题。
-- **兼容性强**：自动处理多模态降级（不支持图片的模型替换为占位符）、兼容 dashscope 风格 SSE（无空格）、自动清理 MiniMax 系列无效 `tool_use` 等边角情况。
+- **可观测性**：完整记录每次请求的时间、IP、源模型、目标模型、provider、token、缓存 token、耗时、状态码、请求/响应体，便于排查问题。
+- **自动重试与容错**：请求出错或上游返回 4xx/5xx 时自动重试，连接级异常（超时、断开、Chunked 错误）全覆盖。
+- **兼容性强**：自动处理多模态降级（不支持图片的模型替换为占位符）、兼容 dashscope 风格 SSE（无空格）、自动清理 MiniMax 系列无效 `tool_use`、适配 DeepSeek 思考模式等边角情况。
+- **OAuth 2.1 支持**：实现 PKCE、动态客户端注册、JWT 访问令牌与 RFC 8414/9728 元数据端点，供 Claude Code 等支持 OAuth 登录的客户端使用。
 
 ---
 
@@ -31,7 +34,10 @@
   - 启用/禁用（手动或自动）
   - 最大并发数（`max_concurrency`，0 表示不限）
   - "禁用原因"区分（自动禁用时记录原因）
-- 请求转发时按**请求协议**路由到对应的 URL：Anthropic 协议请求（`/anthropic/*`）走 `anthropic_url`，OpenAI 协议请求（`/v1/*`）走 `openai_url`，不做协议格式转换；URL 需填到完整端点（如 `.../v1/messages`、`.../v4/chat/completions`），系统不会自动拼接路径
+  - **「完整路径」开关（`full_path`）**：控制转发时是否自动拼接路径后缀
+    - **完整路径（默认，`full_path=1`）**：配置的 URL 原样使用，不拼接任何后缀。适用于 URL 已含完整端点的情况（如 `https://api.anthropic.com/v1/messages`）。
+    - **Base 路径（`full_path=0`）**：转发时自动在 `anthropic_url` 后拼接 `/v1/messages`，在 `openai_url` 后拼接 `/chat/completions`。适用于只填到 base 路径的情况（如 `https://api.anthropic.com`）。
+- 请求转发时按**请求协议**路由到对应的 URL：Anthropic 协议请求（`/anthropic/*`）走 `anthropic_url`，OpenAI 协议请求（`/v1/*`、`/openai/*`）走 `openai_url`，不做协议格式转换（Responses 除外，它会先与 Chat Completions 互转）
 - 若某 provider 未配置对应协议的 URL，则该协议的请求会自动排除该 provider（包括模型映射分组与兜底转发）
 - 后台自动统计每个 provider 的实时并发使用量
 
@@ -40,7 +46,12 @@
 - 别名（alias）→ 真实模型名 + provider
 - **分组名**：同一个 `group_name` 下的多个映射共享同一个总模型名，系统会按 `priority` 加权轮询选择，**按客户端 IP 隔离**，并自动选当前并发最低的 provider
 - **模型类型**：标记 `text` / 多模态，便于后续扩展
-- **max_tokens**：可强制覆盖请求的 `max_tokens` 字段
+- **max_tokens**：可强制覆盖请求的 `max_tokens` 字段（0 = 不覆盖）
+- **角色映射（role_mappings）**：在转发前对请求中的 `messages` 角色进行替换，以 JSON 数组形式配置多条规则
+  - 每条规则形如 `{"from": "developer", "to": "system"}`
+  - 以**一次性映射**方式应用（相同原角色只取第一条规则，避免链式替换 A→B、B→C 把 A 变成 C）
+  - Anthropic 链路中**在 system 消息提取之前**执行，因此 `developer → system` 的替换结果能正确归入顶层 `system` 字段
+  - 典型用途：让只认 `system` 角色的上游接收 `developer` / `system` 角色消息（如 Claude Code 的 `developer` 消息）
 - 启用/禁用
 
 ### 4. 错误码映射（Error Mapping）
@@ -51,10 +62,10 @@
 
 ### 5. 请求日志
 
-- 记录：时间、客户端 IP、provider、源模型、目标模型、输入/输出 token、缓存 token、耗时、状态、原始/映射错误码、请求/响应体、错误信息
+- 记录：时间、客户端 IP、provider、**源模型（别名）**、目标模型、输入/输出 token、缓存 token（读/建）、耗时、状态、原始/映射错误码、请求/响应体、错误信息
 - 按状态、模型、IP、provider 多条件过滤
 - 按时间分页
-- 支持**自动清理**：保留最近 N 天（可在设置中开启，默认 7 天）
+- 支持**自动清理**：保留最近 N 天（可在设置中开启，默认 7 天），并按设定间隔（默认 1 小时）检查清理
 
 ### 6. 计费与限额（Billing）
 
@@ -65,34 +76,64 @@
   - `token_count` — 按 token 用量限速
   - `balance` — 预付费余额模式（按 input/output 单价扣费）
 - **3 个时间窗口限额**：5 小时、周、月（任意可空）
-- **告警阈值**：达到 80%（可配）时打印警告日志
+- **告警阈值**：达到阈值（默认 80%）时打印警告日志
 - **自动禁用**：超限后自动禁用 provider 并标记 `disable_reason`
 - **到期日期**：可设置 `expiration_date`，到期后自动禁用
 - **窗口重置**：后台线程定期重置过期窗口并自动重新启用已恢复的 provider
+- **缓存计费折扣**：`balance` 模式下，缓存读取 token（`cache_read_input_tokens`）按 10% 计费（即 90% 折扣）
+- **余额保护**：更新计费配置时，若 `balance` 模式下未显式提供 `balance` 字段，则保留数据库中已扣减后的当前余额，避免被覆盖
 
 ### 7. API Key 管理
 
-- 后台可生成多个 API Key（`sk-xxx` 格式），设置名称、启用/禁用、记录最后使用时间
+- 后台可生成多个 API Key，格式为 `sk-` + 48 位十六进制随机串
+- 设置名称、启用/禁用、记录最后使用时间
+- 完整 Key 仅在创建时返回一次，列表查询只显示前缀（如 `sk-xxxxxxxx...`）
 - 代理路由校验 Key 合法性，非法 Key 返回 401
 
-### 8. Web 管理界面
+### 8. OAuth 2.1（供 Claude Code 等客户端登录）
 
-`http://localhost:5000/`（默认），登录后包含 5 个 Tab：
+实现 OAuth 2.1 + PKCE + 动态注册 + JWT 访问令牌，符合 RFC 6749 / RFC 8414 / RFC 9728：
 
-- **提供商管理**：增删改查、查看调用次数与 Token、用量
-- **模型映射**：增删改查、分组配置
+- **PKCE**：`code_verifier` + `code_challenge`（仅支持 `S256` 方法）
+- **动态客户端注册**：`POST /oauth/register`，支持配置 `client_name`、`redirect_uris`、`grant_types`、`response_types`、`token_endpoint_auth_method`（`none` 时为 public client，不发 `client_secret`）
+- **授权端点**：`GET/POST /oauth/authorize`，授权码 10 分钟过期；未登录用户会先跳登录页，登录后自动恢复 OAuth 流程
+- **令牌端点**：`POST /oauth/token`，支持 `authorization_code`（校验 PKCE + redirect_uri，签发 1 小时 access_token 与 30 天 refresh_token）和 `refresh_token` 两种 grant
+- **JWT 访问令牌**：采用 `alg: none` 的简化 JWT（header + payload，无签名），含 `iss` / `sub` / `scope` / `iat` / `exp` / `jti`
+- **元数据端点**：
+  - `GET /.well-known/oauth-authorization-server` — 授权服务器元数据
+  - `GET /.well-known/oauth-protected-resource/<path>` — 受保护资源元数据（RFC 9728）
+  - `GET /.well-known/jwks.json` — JWKS 端点（空实现，因 `alg=none` 无需密钥）
+
+### 9. Web 管理界面
+
+`http://localhost:5000/`（默认），登录后包含 6 个 Tab：
+
+- **提供商管理**：增删改查、查看调用次数与 Token、用量、实时并发、完整路径开关
+- **模型映射**：增删改查、分组配置（列表按分组着色）、角色映射编辑
 - **错误码映射**：全局 / 单 provider 规则
 - **请求日志**：多条件过滤、查看请求/响应详情、清空
+- **API Key**：生成与管理
 - **计费管理**：计费概览 + 单 provider 详细配置
 
-外加：API Key 管理、自动清理设置、使用说明。
+外加：自动清理设置（保留天数、清理间隔）、使用说明。
 
-### 9. 兼容性与稳定性
+### 10. 自动重试与容错
+
+- 首次请求失败后最多重试 3 次（总请求数 ≤ 4）
+- 触发重试的条件：连接级异常（DNS / 握手超时、上游断开、`ChunkedEncodingError`、`ConnectionReset` 等）或 HTTP 4xx/5xx
+- **耗时保护**：单次请求耗时 ≥ 5 秒时不再重试，避免对已长时间排队的错误（如长时间排队后返回 429）做无谓重试
+- 重试间隔 1 秒
+- 仅记录最后一次请求的日志，避免重试污染统计
+
+### 11. 兼容性与稳定性
 
 - **dashscope SSE 兼容**：正确解析 `data:{...}`（无空格）格式以统计流式 token
-- **MiniMax 系列**：自动清理无效 `tool_use` 消息，避免 400 报错
-- **多模态降级**：当目标模型不支持图片时，自动把 `image` block 替换为占位文本
-- **持久化 session**：密钥存 SQLite，重启不丢登录态
+- **MiniMax 系列**：自动清理 assistant 消息中 `name` 为空的 `tool_use` 块，并同步移除引用这些 id 的 `tool_result`，避免 400 报错
+- **DeepSeek 思考模式适配**：移除上游不接受的 `thinking` 参数；将 Anthropic 的 `budget_tokens` 映射为 `output_config.effort`（≥10000 → `max`，否则 `high`）；修复非法 `metadata.user_id`；必要时自动插入空 `thinking` 块
+- **多模态降级**：当目标模型不支持图片（`model_type != multimodal`）时，自动把 `image` block 替换为占位文本；分组内若存在多模态候选，含图片请求会优先选多模态映射
+- **系统消息归位**：Anthropic 协议转发前，自动把 `messages` 中 `role=system` 的消息提取到请求体顶层 `system` 字段
+- **持久化 session**：Flask 密钥存于 SQLite（`settings.secret_key`，启动时生成一次），重启不丢登录态
+- **数据库自动压缩（VACUUM）**：后台线程在每天跨天时执行一次 `VACUUM`，启动时也会异步执行一次，防止数据库膨胀；全程使用 WAL 模式提升并发读写
 
 ---
 
@@ -156,7 +197,7 @@ app.run(host="0.0.0.0", port=5000, debug=True)
 浏览器访问 `http://localhost:5000/`，首次启动会要求登录：
 
 - 用户名 / 密码存储在 `admin_users` 表中
-- 启动后没有任何管理员账号，需要通过 `config.py` 或直接操作 SQLite 手动创建（参见 [附录 A](#附录-a-创建首个管理员账号)）
+- **首次启动会自动创建默认管理员账号**：用户名 `admin`，密码 `admin123`（**请登录后立即在管理界面或数据库中修改**）
 
 ### 2. 添加 API Provider
 
@@ -165,14 +206,17 @@ app.run(host="0.0.0.0", port=5000, debug=True)
 | 字段 | 说明 |
 | --- | --- |
 | 名称 | 显示名（例：`AWS Claude`） |
-| Anthropic URL | Anthropic 协议**完整端点地址**（例：`https://api.anthropic.com/v1/messages`），系统不自动拼接路径，留空则不转发 Anthropic 协议请求 |
-| OpenAI URL | OpenAI 协议**完整端点地址**（例：`https://api.openai.com/v1/chat/completions`），系统不自动拼接路径，留空则不转发 OpenAI 协议请求 |
+| Anthropic URL | Anthropic 协议端点地址，留空则不转发 Anthropic 协议请求 |
+| OpenAI URL | OpenAI 协议端点地址，留空则不转发 OpenAI 协议请求 |
+| 完整路径 | 勾选（默认）：URL 原样使用；取消勾选：自动在 Anthropic URL 后拼 `/v1/messages`、在 OpenAI URL 后拼 `/chat/completions` |
 | API Key | 上游 Key |
 | 最大并发 | 0 = 不限；N = 同时最多 N 个请求 |
 
+> 示例：完整路径模式填 `https://api.anthropic.com/v1/messages`；base 路径模式填 `https://api.anthropic.com`（系统自动补全后缀）。
+
 ### 3. 创建 API Key
 
-进入 **API Key 管理** → 输入 Key 名称 → 添加。系统会返回形如 `sk-xxxxxxxx` 的 Key，**仅显示一次**，请妥善保存。
+进入 **API Key** Tab → 输入 Key 名称 → 添加。系统会返回形如 `sk-` + 48 位的 Key，**仅显示一次**，请妥善保存（列表中之后只显示前缀）。
 
 ### 4. 创建模型映射
 
@@ -181,9 +225,11 @@ app.run(host="0.0.0.0", port=5000, debug=True)
 - **别名**：客户端请求时的 `model` 字段值（例：`claude-sonnet-4`）
 - **目标模型**：上游真实模型名（例：`claude-sonnet-4-5-20250929`）
 - **提供商**：选一个
-- **分组名**（可选）：填了之后，多条同分组的映射会按优先级+加权轮询选择
+- **分组名**（可选）：填了之后，多条同分组的映射会按优先级 + 加权轮询选择（按客户端 IP 隔离）
 - **优先级**：数字越小优先级越高
 - **max_tokens**：0 = 不覆盖；>0 = 强制覆盖请求的 `max_tokens`
+- **模型类型**：`text` / 多模态
+- **角色映射**：可配置多条 `from → to` 规则（如 `developer → system`），转发前对请求消息角色做一次性替换
 
 ### 5. 客户端接入
 
@@ -224,6 +270,8 @@ export ANTHROPIC_BASE_URL=http://localhost:5000/anthropic
 export ANTHROPIC_AUTH_TOKEN=sk-你的Key
 ```
 
+Claude Code 也支持通过 OAuth 登录流程接入本服务（见 [第六章 OAuth 接入](#六oauth-接入-claude-code)）。
+
 #### OpenAI 兼容客户端
 
 ```bash
@@ -243,9 +291,11 @@ export OPENAI_API_KEY=sk-你的Key
 ```
 
 Codex CLI 会自动请求 `OPENAI_BASE_URL/responses`（即 `http://localhost:5000/openai/responses`），本服务接收后：
-1. 将 Responses 格式请求（`input` / `instructions` 等）转换为 Chat Completions 格式（`messages` / `system` 等）
+1. 将 Responses 格式请求（`input` / `instructions` / `tools` / `tool_choice` 等）转换为 Chat Completions 格式（`messages` / `system` 等）
 2. 转发到对应 provider 的 `openai_url`
 3. 将上游返回的 Chat Completions 响应转换回 Responses 格式返回
+
+**流式响应**会按 Responses SSE 事件序列输出（`response.created` → `response.output_item.added` → `response.output_text.delta` → … → `response.completed`），其中**工具调用作为独立的 `function_call` output_item 发送**，确保 Codex CLI 能正确解析为结构化工具调用。同时系统会自动注入 `stream_options.include_usage`，保证末帧带回 token 用量。
 
 也可直接用 curl 测试：
 
@@ -279,9 +329,19 @@ curl -X POST http://localhost:5000/openai/responses \
 - **5h 限额**：1000（可选）
 - **告警阈值**：0.8
 
-配置后，余额按真实使用量自动扣减；超限时自动禁用该 provider。
+配置后，余额按真实使用量自动扣减（缓存读取 token 享 90% 折扣）；超限时自动禁用该 provider。
 
-### 8. 自动清理日志
+### 8. 角色映射示例
+
+某上游只认 `system` 角色，但 Claude Code 发来的是 `developer` 角色消息。在模型映射中配置角色映射规则：
+
+| from | to |
+| --- | --- |
+| `developer` | `system` |
+
+转发前，请求中的 `developer` 消息会被替换为 `system`，并自动归入 Anthropic 顶层 `system` 字段。
+
+### 9. 自动清理日志
 
 设置 → **自动清理** → 开启、选择保留天数（默认 7 天）和清理间隔（默认 1 小时）。
 
@@ -291,9 +351,9 @@ curl -X POST http://localhost:5000/openai/responses \
 
 ```
 ai-api-proxy/
-├── app.py              # Flask 入口、路由、后台任务
+├── app.py              # Flask 入口、路由、认证中间件、后台任务
 ├── config.py           # SQLite 封装、表迁移、所有数据库操作
-├── proxy.py            # 核心代理逻辑（路由、并发、流式、多模态降级等）
+├── proxy.py            # 核心代理逻辑（路由、并发、流式、角色映射、重试、多模态降级等）
 ├── oauth.py            # OAuth 2.1 / PKCE / JWT 实现
 ├── requirements.txt    # 依赖
 ├── proxy.db            # SQLite 数据库（自动创建，已 gitignore）
@@ -307,20 +367,36 @@ ai-api-proxy/
 
 ---
 
-## 六、注意事项
+## 六、OAuth 接入 Claude Code
 
-1. **SQLite 表结构变更**：本项目遵循"先备份 → DROP → 重建 → 回填"的迁移流程（见 `config.py` 中各 `_migrate_*` 函数），**禁止直接 `DROP TABLE` 而不保留数据**。
-2. **API Key 安全**：管理员账号与 API Key 均以哈希/随机串形式存于 SQLite，请妥善保管 `proxy.db`。
-3. **生产部署**：建议关闭 `debug=True`，配合反向代理（Nginx/Caddy）并启用 HTTPS。
+Claude Code 支持 OAuth 登录流程。本服务实现的 OAuth 2.1 端点可供其作为授权服务器使用：
+
+1. **客户端注册**：Claude Code 启动时会通过 `POST /oauth/register` 动态注册客户端（`token_endpoint_auth_method=none`，public client）。
+2. **授权码 + PKCE**：客户端携带 `code_verifier` / `code_challenge` 跳转 `GET /oauth/authorize`；若用户未登录，先跳登录页，登录后自动回到授权流程并下发授权码。
+3. **换取令牌**：客户端用授权码 + `code_verifier` 调用 `POST /oauth/token` 换取 access_token（1 小时）与 refresh_token（30 天）。
+4. **访问代理**：客户端携带 `Authorization: Bearer <access_token>` 访问受保护资源。
+
+元数据可通过 `GET /.well-known/oauth-authorization-server` 获取。
+
+> 说明：本服务历史版本曾提供 MCP 图片理解功能与 `/mcp` 路由，现已移除；当前 `/mcp` 仅保留认证中间件的防御性逻辑，OAuth 端点主要用于 Claude Code 的登录接入。
 
 ---
 
-## 附录 A：创建首个管理员账号
+## 七、注意事项
 
-`proxy.db` 中 `admin_users` 表是空的，需手动创建一条记录：
+1. **SQLite 表结构变更**：本项目遵循"先备份 → DROP → 重建 → 回填"的迁移流程（见 `config.py` 中各 `_migrate_*` 函数），**禁止直接 `DROP TABLE` 而不保留数据**。部分一次性历史迁移用 `PRAGMA user_version` 标记，避免重复执行。
+2. **API Key 安全**：管理员账号与 API Key 均以哈希 / 随机串形式存于 SQLite，请妥善保管 `proxy.db`。默认管理员 `admin / admin123` 务必尽快修改。
+3. **生产部署**：建议关闭 `debug=True`，配合反向代理（Nginx/Caddy）并启用 HTTPS。OAuth 的 access_token 采用 `alg: none` 的简化 JWT，仅适合内网 / 受信环境，公网部署请评估风险。
+4. **数据库维护**：VACUUM 会在每天跨天与启动时异步执行；如需手动压缩，可在低峰期对 `proxy.db` 执行 `VACUUM`。
+
+---
+
+## 附录 A：创建 / 重置管理员账号
+
+首次启动时 `init_db()` 会自动创建默认管理员 `admin / admin123`。如需手动创建或重置，可执行：
 
 ```python
-import sqlite3, secrets
+import sqlite3
 from werkzeug.security import generate_password_hash
 
 conn = sqlite3.connect("proxy.db")
@@ -328,12 +404,12 @@ username = "admin"
 password = "你的密码"  # 请改
 pw_hash = generate_password_hash(password)
 conn.execute(
-    "INSERT INTO admin_users (username, password_hash, created_at) VALUES (?, ?, datetime('now'))",
+    "INSERT OR REPLACE INTO admin_users (username, password_hash, created_at) VALUES (?, ?, datetime('now'))",
     (username, pw_hash),
 )
 conn.commit()
 conn.close()
-print(f"已创建管理员: {username}")
+print(f"已创建/重置管理员: {username}")
 ```
 
 之后即可在登录页使用该账号登录。
