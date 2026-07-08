@@ -1,5 +1,3 @@
 __pycache__/**
 proxy.db
 *.sql
-.claude/**
-CLAUDE.md
