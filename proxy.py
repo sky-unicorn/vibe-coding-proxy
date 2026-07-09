@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import json
 import re
 import time
@@ -11,20 +12,23 @@ import config
 # 连接级异常：上游断开或客户端断开，属于正常中断，不按业务错误处理
 _CONN_ABORT_ERRORS = (_ReqConnError, ChunkedEncodingError, _ReqTimeout, ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError)
 
-# 重试策略配置：所有请求错误都参与重试，但有耗时与次数上限
+# 重试策略配置：仅对 5xx 和连接级异常重试，4xx 视为客户端/上游语义错误立即返回
 _RETRY_MAX_ATTEMPTS = 3        # 最多重试次数（首次失败后最多再重试 3 次，总请求数 ≤ 4）
 _RETRY_MAX_DURATION = 5.0      # 单次请求耗时上限（秒）：超过则不再重试，避免对已处理很久的错误做无谓重试
 _RETRY_DELAY = 1.0             # 重试间隔（秒）
 
 
 def _post_with_retry(url, max_retries=_RETRY_MAX_ATTEMPTS, retry_delay=_RETRY_DELAY, retry_max_duration=_RETRY_MAX_DURATION, **kwargs):
-    """发起 HTTP POST 请求，遇到任何错误时按策略自动重试。
+    """发起 HTTP POST 请求，仅对 5xx 和连接级异常按策略自动重试。
 
     重试触发条件（需同时满足）：
       1. 请求出错：连接级异常（DNS 失败 / 连接被上游中止 / 握手超时 / ChunkedEncodingError 等）
-                  或 HTTP 4xx/5xx 错误码；
+                  或 HTTP 5xx 错误码；
       2. 单次请求耗时 < retry_max_duration 秒（上游已处理很久的错误重试代价高，不再重试）；
       3. 未达到最大重试次数 max_retries。
+
+    4xx 视为客户端/上游语义错误（如 401/403/404 等），重试无意义，立即返回 resp 交由调用方处理
+    （避免浪费上游配额并放大延迟）。
 
     该函数内部循环重试，仅返回最终结果（成功响应或最后一次的失败响应/异常），
     调用方在外层据此只记录一次日志——天然满足"只记录最后一次请求日志"。
@@ -35,11 +39,12 @@ def _post_with_retry(url, max_retries=_RETRY_MAX_ATTEMPTS, retry_delay=_RETRY_DE
         try:
             resp = http_requests.post(url, **kwargs)
             elapsed = time.time() - start
-            # HTTP 4xx/5xx：仅在耗时较短且仍有重试机会时关闭并重试
-            if resp.status_code >= 400 and elapsed < retry_max_duration and attempt < max_retries:
+            # HTTP 5xx：仅在耗时较短且仍有重试机会时关闭并重试
+            if resp.status_code >= 500 and elapsed < retry_max_duration and attempt < max_retries:
                 resp.close()
                 time.sleep(retry_delay)
                 continue
+            # HTTP 4xx：客户端/上游语义错误，立即返回，不重试
             return resp
         except _CONN_ABORT_ERRORS as e:
             last_err = e
@@ -248,10 +253,25 @@ def _track_request_end(provider_id):
 
 
 def _release_concurrency(provider_id, sem=None):
-    """释放并发资源：减少信号量槽位 + 递减活跃请求计数"""
+    """释放并发资源：减少信号量槽位 + 递减活跃请求计数。
+
+    幂等设计：可被多次调用，但日志会记录异常情况（活跃计数为 0 仍调用）
+    以便排查重复释放问题。
+    """
     if sem:
-        sem.release()
-    _track_request_end(provider_id)
+        try:
+            sem.release()
+        except ValueError:
+            # 信号量已释放到上限（重复释放），记录但不影响主流程
+            print(f"[并发] 警告: provider_id={provider_id} 信号量重复释放（已忽略）")
+    with _active_lock:
+        count = _active_requests.get(provider_id, 0)
+        if count > 0:
+            _active_requests[provider_id] = count - 1
+        else:
+            # 活跃计数已为 0，说明出现重复释放或未配对的 start
+            _active_requests[provider_id] = 0
+            print(f"[并发] 警告: provider_id={provider_id} 活跃计数已为 0，疑似重复释放")
 
 
 def get_concurrency_status():
@@ -266,6 +286,99 @@ def get_concurrency_status():
         used = active.get(pid, 0)
         result[pid] = {"used": used, "max": max_c, "waiting": 0}
     return result
+
+
+# ---- 服务降级状态管理 ----
+# 按 mapping_id（即 model_mappings 表的 id）粒度维护降级状态。
+# 同一 alias 下不同 provider/目标模型各自独立降级，避免一个故障上游牵连正常上游。
+# _post_with_retry 内部已做 3 次重试，调用方捕获到异常或收到错误响应时
+# 表示真正重试耗尽，直接 mark_degraded，无需额外累积计数。
+_degradation_lock = threading.Lock()
+_degradation_until = {}  # {mapping_id: degraded_until_timestamp}
+
+
+def get_degradation_config():
+    return config.get_degradation_config()
+
+
+def mark_degraded(mapping_id, duration_seconds):
+    """标记某 mapping_id 进入降级状态，duration_seconds 秒内不再被选中。"""
+    if not mapping_id:
+        return
+    with _degradation_lock:
+        _degradation_until[mapping_id] = time.time() + duration_seconds
+
+
+def clear_degraded(mapping_id):
+    """清除某 mapping_id 的降级状态（成功调用后立即恢复）。"""
+    if not mapping_id:
+        return
+    with _degradation_lock:
+        _degradation_until.pop(mapping_id, None)
+
+
+def is_degraded(mapping_id):
+    """检查某 mapping_id 是否处于降级中。过期自动清除。"""
+    if not mapping_id:
+        return False
+    with _degradation_lock:
+        until = _degradation_until.get(mapping_id, 0)
+        if until <= time.time():
+            _degradation_until.pop(mapping_id, None)
+            return False
+        return True
+
+
+def get_degradation_status():
+    """返回所有当前降级中的 mapping_id 状态，供 API 查询。
+
+    返回 dict: {mapping_id: {"degraded": True, "remaining": int}}
+    同时清理已过期的条目。
+    """
+    now = time.time()
+    result = {}
+    with _degradation_lock:
+        expired = [mid for mid, until in _degradation_until.items() if until <= now]
+        for mid in expired:
+            _degradation_until.pop(mid, None)
+        for mid, until in _degradation_until.items():
+            result[mid] = {"degraded": True, "remaining": max(0, int(until - now))}
+    return result
+
+
+def _filter_candidates_by_degradation(candidates, cfg=None):
+    """按降级状态过滤候选池。
+
+    candidates 中每项必须含 "id" 键（Anthropic 路径）或 "mapping_id" 键（OpenAI 路径）。
+    降级未启用时原样返回；有非降级候选时只保留非降级的；全部降级时回退到全量池。
+    """
+    if cfg is None:
+        cfg = get_degradation_config()
+    if not cfg["enabled"]:
+        return candidates
+    non_degraded = [c for c in candidates if not is_degraded(c.get("id") or c.get("mapping_id"))]
+    if non_degraded:
+        return non_degraded
+    # 全部候选都已降级：回退到原始池（仍可被选中），打 warning 便于排查
+    degraded_ids = sorted({c.get("id") or c.get("mapping_id") for c in candidates if (c.get("id") or c.get("mapping_id"))})
+    print(
+        f"[降级] 所有候选均已降级，回退到原始池。mapping_ids={degraded_ids} "
+        f"duration={cfg.get('duration')}s"
+    )
+    return candidates
+
+
+# ---- 响应判断辅助 ----
+
+def _is_streaming_response(response):
+    content, _, _ = response
+    return inspect.isgenerator(content)
+
+def _is_success_response(response):
+    if _is_streaming_response(response):
+        return True
+    _, status_code, _ = response
+    return status_code < 400
 
 
 def _build_weighted_sequence(candidates):
@@ -309,39 +422,97 @@ def handle_proxy_request(request_body, client_ip=""):
 
     # 查找模型映射（新契约：返回 list[dict] 或 None）
     mappings = config.get_model_mapping_by_alias(model)
-    role_rules = []
     if not mappings:
-        # 没有映射，尝试找默认的 anthropic provider 直接转发
+        # 没有映射，尝试找默认的 anthropic provider 直接转发（无 mapping_id，不参与降级）
         providers = config.get_providers()
         anthropic_providers = [p for p in providers if p["enabled"] and p.get("anthropic_url", "")]
-        if anthropic_providers:
-            # 与 OpenAI fallback 保持一致：显式构造 provider dict，
-            # 避免依赖 get_providers() 的返回字段集合（未来裁剪列时 full_path 不致丢失）
-            p0 = anthropic_providers[0]
-            provider = {
-                "id": p0["id"],
-                "name": p0["name"],
-                "anthropic_url": p0["anthropic_url"],
-                "api_key": p0["api_key"],
-                "max_concurrency": p0.get("max_concurrency", 0),
-                "full_path": p0.get("full_path", 1),
-            }
-            target_model = model
-        else:
+        if not anthropic_providers:
             return _error_response(f"未找到模型 '{model}' 的映射，也没有可用的 Anthropic 提供商", 404)
-        model_type = "text"
-        model_max_tokens = 0
-    else:
-        # 命中映射列表：过滤掉没有 anthropic_url 或计费超限的提供商，再按优先级加权轮询
-        available = [m for m in mappings if m.get("anthropic_url", "") and config.check_provider_billing(m["provider_id"])["allowed"]]
-        if not available:
-            return _error_response(f"模型 '{model}' 的所有可用 Anthropic 提供商均已超限或不可用", 429)
-        # 请求含图片时，优先选择多模态模型；无多模态候选项则回退到全部候选项
-        if _has_images_anthropic(request_body):
-            multimodal = [m for m in available if m.get("model_type") == "multimodal"]
-            if multimodal:
-                available = multimodal
-        chosen = _pick_weighted_round_robin(available, client_ip, model)
+        # 与 OpenAI fallback 保持一致：显式构造 provider dict
+        p0 = anthropic_providers[0]
+        provider = {
+            "id": p0["id"],
+            "name": p0["name"],
+            "anthropic_url": p0["anthropic_url"],
+            "api_key": p0["api_key"],
+            "max_concurrency": p0.get("max_concurrency", 0),
+            "full_path": p0.get("full_path", 1),
+        }
+        # 单次尝试，无降级逻辑
+        start_time = time.time()
+        provider_id = provider.get("id", 0)
+        max_concurrency = provider.get("max_concurrency", 0)
+        billing_check = config.check_provider_billing(provider_id)
+        if not billing_check["allowed"]:
+            return _error_response(
+                f"提供商 '{provider['name']}' 已被限制: {billing_check['reason']}", 429
+            )
+        if billing_check["near_limit"]:
+            print(f"[计费警告] 提供商 '{provider['name']}' 使用量已达 {billing_check['usage_percent']:.0%}")
+        sem = _get_semaphore(provider_id, max_concurrency)
+        if sem:
+            sem.acquire()
+        _track_request_start(provider_id)
+        try:
+            response = _proxy_anthropic(request_body, provider, model, stream, sem, client_ip, start_time, "text", model, 0, [])
+        except Exception as e:
+            _release_concurrency(provider_id, sem)
+            duration_ms = int((time.time() - start_time) * 1000)
+            if isinstance(e, _CONN_ABORT_ERRORS):
+                msg = f"连接中断: {type(e).__name__}"
+                config.add_log(
+                    provider=provider["name"], model=model, source_model=model,
+                    input_tokens=0, output_tokens=0,
+                    status="error", duration_ms=duration_ms,
+                    error_msg=msg, request_body=json.dumps(request_body, ensure_ascii=False),
+                    client_ip=client_ip,
+                )
+                return _error_response(msg, 502)
+            config.add_log(
+                provider=provider["name"], model=model, source_model=model,
+                input_tokens=0, output_tokens=0,
+                status="error", duration_ms=duration_ms,
+                error_msg=str(e), request_body=json.dumps(request_body, ensure_ascii=False),
+                client_ip=client_ip,
+            )
+            return _error_response(str(e), 502)
+        # 成功：非流式需释放；流式由 _stream_response/generate() 自行释放
+        if not stream:
+            _release_concurrency(provider_id, sem)
+        return response
+
+    # ---- 命中映射列表：failover 循环 ----
+    # 过滤掉没有 anthropic_url 的提供商（计费超限在循环内逐个判断，便于 failover）
+    candidates = [m for m in mappings if m.get("anthropic_url", "")]
+    if not candidates:
+        return _error_response(f"模型 '{model}' 的所有可用 Anthropic 提供商均不可用", 429)
+
+    # 请求含图片时，优先选择多模态模型；无多模态候选项则回退到全部候选项
+    if _has_images_anthropic(request_body):
+        multimodal = [m for m in candidates if m.get("model_type") == "multimodal"]
+        if multimodal:
+            candidates = multimodal
+
+    cfg = get_degradation_config()
+    attempted = set()  # 已尝试的 mapping id（同一请求内不重复尝试）
+    last_response = None  # 最近一次失败响应，全部尝试完后返回
+    _max_loop_iterations = 100  # 防御性兜底：防止极端退化场景下的无限循环
+
+    for _loop_iter in range(_max_loop_iterations):
+        # 从未尝试过的候选中按降级状态过滤，为空则回退到未过滤列表
+        untried = [c for c in candidates if c.get("id") not in attempted]
+        if not untried:
+            break
+        filtered = _filter_candidates_by_degradation(untried, cfg)
+        if not filtered:
+            break
+        chosen = _pick_weighted_round_robin(filtered, client_ip, model)
+        if chosen is None:
+            break
+        mid = chosen.get("id")
+        attempted.add(mid)
+        alias = chosen.get("alias")
+
         provider = {
             "id": chosen["provider_id"],
             "name": chosen["provider_name"],
@@ -354,36 +525,34 @@ def handle_proxy_request(request_body, client_ip=""):
         model_type = chosen.get("model_type", "text")
         model_max_tokens = chosen.get("max_tokens", 0)
         role_rules = _role_replace_rules(chosen)
+        provider_id = provider.get("id", 0)
+        max_concurrency = provider.get("max_concurrency", 0)
 
-    start_time = time.time()
-    provider_id = provider.get("id", 0)
-    max_concurrency = provider.get("max_concurrency", 0)
+        # 计费检查：超限则跳过（不降级，仅加入 attempted）
+        billing_check = config.check_provider_billing(provider_id)
+        if not billing_check["allowed"]:
+            last_response = _error_response(
+                f"提供商 '{provider['name']}' 已被限制: {billing_check['reason']}", 429
+            )
+            continue
+        if billing_check["near_limit"]:
+            print(f"[计费警告] 提供商 '{provider['name']}' 使用量已达 {billing_check['usage_percent']:.0%}")
 
-    # 计费检查：provider 是否超限或过期
-    billing_check = config.check_provider_billing(provider_id)
-    if not billing_check["allowed"]:
-        return _error_response(
-            f"提供商 '{provider['name']}' 已被限制: {billing_check['reason']}", 429
-        )
-    if billing_check["near_limit"]:
-        print(f"[计费警告] 提供商 '{provider['name']}' 使用量已达 {billing_check['usage_percent']:.0%}")
+        start_time = time.time()
+        sem = _get_semaphore(provider_id, max_concurrency)
+        if sem:
+            sem.acquire()
+        _track_request_start(provider_id)
 
-    # 获取并发信号量（如果配置了限制）
-    sem = _get_semaphore(provider_id, max_concurrency)
-
-    if sem:
-        # 阻塞等待获取信号量，对 Claude Code 来说只是响应慢了
-        sem.acquire()
-    _track_request_start(provider_id)
-
-    try:
-        return _proxy_anthropic(request_body, provider, target_model, stream, sem, client_ip, start_time, model_type, model, model_max_tokens, role_rules)
-
-    except Exception as e:
-        _release_concurrency(provider_id, sem)
-        duration_ms = int((time.time() - start_time) * 1000)
-        if isinstance(e, _CONN_ABORT_ERRORS):
-            # 连接级异常：上游断开/超时/DNS解析失败，提供更友好的错误信息
+        # 信号量释放由外部处理器统一负责：
+        # - 非流式：_proxy_anthropic 不再在内部 finally 释放，由本处 except/成功/失败响应 路径释放
+        # - 流式：_stream_response 在 status>=400 时内部释放，或由 generate() finally 释放；
+        #   仅当 _post_with_retry 抛出异常时由本处 except 释放
+        try:
+            response = _proxy_anthropic(request_body, provider, target_model, stream, sem, client_ip, start_time, model_type, model, model_max_tokens, role_rules, mid, cfg.get("duration", 30))
+        except _CONN_ABORT_ERRORS as e:
+            _release_concurrency(provider_id, sem)
+            duration_ms = int((time.time() - start_time) * 1000)
             msg = f"连接中断: {type(e).__name__}"
             config.add_log(
                 provider=provider["name"], model=target_model, source_model=model,
@@ -392,27 +561,58 @@ def handle_proxy_request(request_body, client_ip=""):
                 error_msg=msg, request_body=json.dumps(request_body, ensure_ascii=False),
                 client_ip=client_ip,
             )
-            return _error_response(msg, 502)
-        config.add_log(
-            provider=provider["name"], model=target_model, source_model=model,
-            input_tokens=0, output_tokens=0,
-            status="error", duration_ms=duration_ms,
-            error_msg=str(e), request_body=json.dumps(request_body, ensure_ascii=False),
-            client_ip=client_ip,
-        )
-        return _error_response(str(e), 502)
+            last_response = _error_response(msg, 502)
+            mark_degraded(mid, cfg.get("duration", 30))
+            continue
+        except Exception as e:
+            _release_concurrency(provider_id, sem)
+            duration_ms = int((time.time() - start_time) * 1000)
+            config.add_log(
+                provider=provider["name"], model=target_model, source_model=model,
+                input_tokens=0, output_tokens=0,
+                status="error", duration_ms=duration_ms,
+                error_msg=str(e), request_body=json.dumps(request_body, ensure_ascii=False),
+                client_ip=client_ip,
+            )
+            last_response = _error_response(str(e), 502)
+            mark_degraded(mid, cfg.get("duration", 30))
+            continue
+
+        # 成功（含流式已开始）：非流式需在此释放；流式由 _stream_response/generate() 自行释放
+        if _is_success_response(response):
+            if not stream:
+                _release_concurrency(provider_id, sem)
+            clear_degraded(mid)
+            return response
+
+        # 失败响应：非流式需在此释放；流式由 _stream_response 内部释放
+        if not stream:
+            _release_concurrency(provider_id, sem)
+        last_response = response
+        mark_degraded(mid, cfg.get("duration", 30))
+        continue
+    else:
+        # 防御性兜底：达到最大循环次数仍未结束，记录并退出
+        print(f"[failover] 警告: 达到最大循环次数 {_max_loop_iterations} 仍未结束，强制退出。model={model}")
+
+    # 所有候选尝试完仍失败
+    if last_response is not None:
+        return last_response
+    return _error_response(f"模型 '{model}' 没有可用的 Anthropic 提供商", 503)
 
 
 def _resolve_openai_provider(request_body, client_ip=""):
-    """解析 OpenAI 协议请求的 provider / 目标模型（Chat Completions 与 Responses 入口共用）。
+    """解析 OpenAI 协议请求的候选池（Chat Completions 与 Responses 入口共用）。
 
-    返回 (provider, target_model, model_type, model_max_tokens, role_rules) 或
-    (None, error_message, None, None, None) 表示解析失败（调用方按自身错误格式包装）。
-    其中 role_rules 是命中的模型映射的「角色映射」规则列表（list[dict]，可能为空）；
-    fallback（无映射）场景为 [] 表示不做替换。
+    返回 (candidates, error_message)：
+      - 成功：candidates 为 list[dict]，每项含 provider / target_model / model_type /
+              model_max_tokens / role_rules / mapping_id；error_message 为 None。
+              fallback（无映射）场景只有一个候选，mapping_id 为 None（不参与降级）。
+      - 失败：candidates 为 None，error_message 为错误描述（调用方按自身错误格式包装）。
     解析规则：
-      - 别名无映射 → 取首个配置了 openai_url 的启用 provider 作兜底
-      - 别名命中映射列表 → 过滤 openai_url + 计费可用项，加权轮询，含图片时优先多模态
+      - 别名无映射 → 取首个配置了 openai_url 的启用 provider 作兜底（单候选，无 mapping_id）
+      - 别名命中映射列表 → 过滤 openai_url 可用项，含图片时优先多模态
+    计费检查放在 failover 循环内逐候选判断，便于超限时切换到下一个。
     """
     model = request_body.get("model", "")
     mappings = config.get_model_mapping_by_alias(model)
@@ -420,37 +620,56 @@ def _resolve_openai_provider(request_body, client_ip=""):
         providers = config.get_providers()
         openai_providers = [p for p in providers if p["enabled"] and p.get("openai_url", "")]
         if openai_providers:
+            p0 = openai_providers[0]
             provider = {
-                "id": openai_providers[0]["id"],
-                "name": openai_providers[0]["name"],
-                "openai_url": openai_providers[0]["openai_url"],
-                "api_key": openai_providers[0]["api_key"],
-                "max_concurrency": openai_providers[0].get("max_concurrency", 0),
-                "full_path": openai_providers[0].get("full_path", 1),
+                "id": p0["id"],
+                "name": p0["name"],
+                "openai_url": p0["openai_url"],
+                "api_key": p0["api_key"],
+                "max_concurrency": p0.get("max_concurrency", 0),
+                "full_path": p0.get("full_path", 1),
             }
-            return provider, model, "text", 0, []
-        return None, f"未找到模型 '{model}' 的映射，也没有可用的 OpenAI 提供商", None, None, None
+            return [{
+                "provider": provider,
+                "target_model": model,
+                "model_type": "text",
+                "model_max_tokens": 0,
+                "role_rules": [],
+                "mapping_id": None,
+                "priority": 1,
+            }], None
+        return None, f"未找到模型 '{model}' 的映射，也没有可用的 OpenAI 提供商"
     else:
-        # 命中映射列表：过滤掉没有 openai_url 或计费超限的提供商，再按优先级加权轮询
-        available = [m for m in mappings if m.get("openai_url", "") and config.check_provider_billing(m["provider_id"])["allowed"]]
+        # 命中映射列表：过滤掉没有 openai_url 的提供商（计费超限在循环内逐个判断）
+        available = [m for m in mappings if m.get("openai_url", "")]
         if not available:
-            return None, f"模型 '{model}' 的所有可用 OpenAI 提供商均已超限或不可用", None, None, None
+            return None, f"模型 '{model}' 的所有可用 OpenAI 提供商均不可用"
         # 请求含图片时，优先选择多模态模型；无多模态候选项则回退到全部候选项
         if _has_images_openai(request_body):
             multimodal = [m for m in available if m.get("model_type") == "multimodal"]
             if multimodal:
                 available = multimodal
-        chosen = _pick_weighted_round_robin(available, client_ip, model)
-        provider = {
-            "id": chosen["provider_id"],
-            "name": chosen["provider_name"],
-            "openai_url": chosen["openai_url"],
-            "api_key": chosen["api_key"],
-            "max_concurrency": chosen.get("provider_max_concurrency", 0),
-            "full_path": chosen.get("full_path", 1),
-        }
-        return (provider, chosen["target_model"], chosen.get("model_type", "text"), chosen.get("max_tokens", 0),
-                _role_replace_rules(chosen))
+        candidates = []
+        for m in available:
+            provider = {
+                "id": m["provider_id"],
+                "name": m["provider_name"],
+                "openai_url": m["openai_url"],
+                "api_key": m["api_key"],
+                "max_concurrency": m.get("provider_max_concurrency", 0),
+                "full_path": m.get("full_path", 1),
+            }
+            candidates.append({
+                "provider": provider,
+                "target_model": m["target_model"],
+                "model_type": m.get("model_type", "text"),
+                "model_max_tokens": m.get("max_tokens", 0),
+                "role_rules": _role_replace_rules(m),
+                "mapping_id": m.get("id"),
+                "alias": m.get("alias"),
+                "priority": m.get("priority", 1),
+            })
+        return candidates, None
 
 
 def handle_openai_proxy_request(request_body, client_ip=""):
@@ -458,37 +677,64 @@ def handle_openai_proxy_request(request_body, client_ip=""):
     model = request_body.get("model", "")
     stream = request_body.get("stream", False)
 
-    # 解析 provider / 目标模型（与 Responses 入口共用同一套逻辑）
-    provider, target_model, model_type, model_max_tokens, role_rules = _resolve_openai_provider(request_body, client_ip)
-    if provider is None:
-        return _error_response_openai(target_model, 404 if "未找到" in target_model or "未配置" in target_model else 429)
+    # 解析候选池（与 Responses 入口共用同一套逻辑）
+    candidates, error_message = _resolve_openai_provider(request_body, client_ip)
+    if candidates is None:
+        return _error_response_openai(error_message, 404 if "未找到" in error_message or "未配置" in error_message else 429)
 
-    start_time = time.time()
-    provider_id = provider.get("id", 0)
-    max_concurrency = provider.get("max_concurrency", 0)
+    cfg = get_degradation_config()
+    attempted = set()  # 已尝试的 mapping id（同一请求内不重复尝试）
+    last_response = None  # 最近一次失败响应，全部尝试完后返回
+    _max_loop_iterations = 100  # 防御性兜底：防止极端退化场景下的无限循环
 
-    # 计费检查：provider 是否超限或过期
-    billing_check = config.check_provider_billing(provider_id)
-    if not billing_check["allowed"]:
-        return _error_response_openai(
-            f"提供商 '{provider['name']}' 已被限制: {billing_check['reason']}", 429
-        )
-    if billing_check["near_limit"]:
-        print(f"[计费警告] 提供商 '{provider['name']}' 使用量已达 {billing_check['usage_percent']:.0%}")
+    for _loop_iter in range(_max_loop_iterations):
+        # 从未尝试过的候选中按降级状态过滤，为空则回退到未过滤列表
+        untried = [c for c in candidates if c["mapping_id"] not in attempted]
+        if not untried:
+            break
+        filtered = _filter_candidates_by_degradation(untried, cfg)
+        if not filtered:
+            break
+        chosen = _pick_weighted_round_robin(filtered, client_ip, model)
+        if chosen is None:
+            break
+        mid = chosen.get("mapping_id")
+        attempted.add(mid)
+        alias = chosen.get("alias")
 
-    sem = _get_semaphore(provider_id, max_concurrency)
-    if sem:
-        sem.acquire()
-    _track_request_start(provider_id)
+        provider = chosen["provider"]
+        target_model = chosen["target_model"]
+        model_type = chosen["model_type"]
+        model_max_tokens = chosen["model_max_tokens"]
+        role_rules = chosen["role_rules"]
+        provider_id = provider.get("id", 0)
+        max_concurrency = provider.get("max_concurrency", 0)
 
-    try:
-        # OpenAI → OpenAI：直接转发到 openai_url
-        return _proxy_openai_direct(request_body, provider, target_model, stream, sem, client_ip, start_time, model_type, model, model_max_tokens, role_rules)
+        # 计费检查：超限则跳过（不降级，仅加入 attempted）
+        billing_check = config.check_provider_billing(provider_id)
+        if not billing_check["allowed"]:
+            last_response = _error_response_openai(
+                f"提供商 '{provider['name']}' 已被限制: {billing_check['reason']}", 429
+            )
+            continue
+        if billing_check["near_limit"]:
+            print(f"[计费警告] 提供商 '{provider['name']}' 使用量已达 {billing_check['usage_percent']:.0%}")
 
-    except Exception as e:
-        _release_concurrency(provider_id, sem)
-        duration_ms = int((time.time() - start_time) * 1000)
-        if isinstance(e, _CONN_ABORT_ERRORS):
+        start_time = time.time()
+        sem = _get_semaphore(provider_id, max_concurrency)
+        if sem:
+            sem.acquire()
+        _track_request_start(provider_id)
+
+        # 信号量释放由本处统一负责：
+        # - 非流式：_proxy_openai_direct 不再在内部 finally 释放，由 except/成功/失败响应 路径释放
+        # - 流式：_stream_response_openai 在 status>=400 时内部释放，或由 generate() finally 释放；
+        #   仅当 _post_with_retry 抛出异常时由本处 except 释放
+        try:
+            response = _proxy_openai_direct(request_body, provider, target_model, stream, sem, client_ip, start_time, model_type, model, model_max_tokens, role_rules, mid, cfg.get("duration", 30))
+        except _CONN_ABORT_ERRORS as e:
+            _release_concurrency(provider_id, sem)
+            duration_ms = int((time.time() - start_time) * 1000)
             msg = f"连接中断: {type(e).__name__}"
             config.add_log(
                 provider=provider["name"], model=target_model, source_model=model,
@@ -497,18 +743,47 @@ def handle_openai_proxy_request(request_body, client_ip=""):
                 error_msg=msg, request_body=json.dumps(request_body, ensure_ascii=False),
                 client_ip=client_ip,
             )
-            return _error_response_openai(msg, 502)
-        config.add_log(
-            provider=provider["name"], model=target_model, source_model=model,
-            input_tokens=0, output_tokens=0,
-            status="error", duration_ms=duration_ms,
-            error_msg=str(e), request_body=json.dumps(request_body, ensure_ascii=False),
-            client_ip=client_ip,
-        )
-        return _error_response_openai(str(e), 502)
+            last_response = _error_response_openai(msg, 502)
+            mark_degraded(mid, cfg.get("duration", 30))
+            continue
+        except Exception as e:
+            _release_concurrency(provider_id, sem)
+            duration_ms = int((time.time() - start_time) * 1000)
+            config.add_log(
+                provider=provider["name"], model=target_model, source_model=model,
+                input_tokens=0, output_tokens=0,
+                status="error", duration_ms=duration_ms,
+                error_msg=str(e), request_body=json.dumps(request_body, ensure_ascii=False),
+                client_ip=client_ip,
+            )
+            last_response = _error_response_openai(str(e), 502)
+            mark_degraded(mid, cfg.get("duration", 30))
+            continue
+
+        # 成功（含流式已开始）：非流式需在此释放；流式由 _stream_response_openai/generate() 自行释放
+        if _is_success_response(response):
+            if not stream:
+                _release_concurrency(provider_id, sem)
+            clear_degraded(mid)
+            return response
+
+        # 失败响应：非流式需在此释放；流式由 _stream_response_openai 内部释放
+        if not stream:
+            _release_concurrency(provider_id, sem)
+        last_response = response
+        mark_degraded(mid, cfg.get("duration", 30))
+        continue
+    else:
+        # 防御性兜底：达到最大循环次数仍未结束，记录并退出
+        print(f"[failover] 警告: 达到最大循环次数 {_max_loop_iterations} 仍未结束，强制退出。model={model}")
+
+    # 所有候选尝试完仍失败
+    if last_response is not None:
+        return last_response
+    return _error_response_openai(f"模型 '{model}' 没有可用的 OpenAI 提供商", 503)
 
 
-def _proxy_openai_direct(request_body, provider, target_model, stream, sem=None, client_ip="", start_time=None, model_type="text", source_model="", model_max_tokens=0, role_rules=None):
+def _proxy_openai_direct(request_body, provider, target_model, stream, sem=None, client_ip="", start_time=None, model_type="text", source_model="", model_max_tokens=0, role_rules=None, mapping_id=None, degradation_duration=0):
     """OpenAI 格式直接转发到 provider 的 openai_url。
 
     full_path=1（默认）：配置的 openai_url 原样使用，不拼接任何后缀。
@@ -539,34 +814,36 @@ def _proxy_openai_direct(request_body, provider, target_model, stream, sem=None,
         body["max_tokens"] = model_max_tokens
 
     if stream:
-        return _stream_response_openai(url, headers, body, provider, target_model, sem, client_ip, start_time, source_model)
+        return _stream_response_openai(url, headers, body, provider, target_model, sem, client_ip, start_time, source_model, mapping_id, degradation_duration)
     else:
-        try:
-            resp = _post_with_retry(url, headers=headers, json=body, timeout=120)
-            resp_json = resp.json()
-            usage = resp_json.get("usage", {})
-            original_code = resp.status_code
-            mapped_code = config.get_mapped_code(original_code, provider["name"])
-            config.add_log(
-                provider=provider["name"], model=target_model, source_model=source_model,
-                input_tokens=usage.get("prompt_tokens", 0), output_tokens=usage.get("completion_tokens", 0),
-                status="success" if original_code == 200 else "error",
-                duration_ms=int((time.time() - start_time) * 1000),
-                error_msg="" if original_code == 200 else json.dumps(resp_json, ensure_ascii=False)[:500],
-                request_body=json.dumps(body, ensure_ascii=False),
-                response_body=json.dumps(resp_json, ensure_ascii=False),
-                original_status_code=original_code, mapped_status_code=mapped_code,
-                client_ip=client_ip,
-            )
-            if original_code == 200:
-                _track_usage(provider.get("id", 0), usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
-            return json.dumps(resp_json, ensure_ascii=False).encode("utf-8"), mapped_code, {"Content-Type": "application/json"}
-        finally:
-            _release_concurrency(provider["id"], sem)
+        # 非流式：信号量由调用方（handle_openai_proxy_request）统一释放，本函数不再在 finally 中释放，
+        # 避免 except 子句双重释放导致并发计数超出初始值
+        resp = _post_with_retry(url, headers=headers, json=body, timeout=120)
+        resp_json = resp.json()
+        usage = resp_json.get("usage", {})
+        original_code = resp.status_code
+        mapped_code = config.get_mapped_code(original_code, provider["name"])
+        config.add_log(
+            provider=provider["name"], model=target_model, source_model=source_model,
+            input_tokens=usage.get("prompt_tokens", 0), output_tokens=usage.get("completion_tokens", 0),
+            status="success" if original_code == 200 else "error",
+            duration_ms=int((time.time() - start_time) * 1000),
+            error_msg="" if original_code == 200 else json.dumps(resp_json, ensure_ascii=False)[:500],
+            request_body=json.dumps(body, ensure_ascii=False),
+            response_body=json.dumps(resp_json, ensure_ascii=False),
+            original_status_code=original_code, mapped_status_code=mapped_code,
+            client_ip=client_ip,
+        )
+        if original_code == 200:
+            _track_usage(provider.get("id", 0), usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+        return json.dumps(resp_json, ensure_ascii=False).encode("utf-8"), mapped_code, {"Content-Type": "application/json"}
 
 
-def _stream_response_openai(url, headers, body, provider, target_model, sem=None, client_ip="", start_time=None, source_model=""):
-    """OpenAI 流式直通转发"""
+def _stream_response_openai(url, headers, body, provider, target_model, sem=None, client_ip="", start_time=None, source_model="", mapping_id=None, degradation_duration=0):
+    """OpenAI 流式直通转发
+
+    alias / cfg 用于流式半失败时（上游在流中途出错，非连接级中断）的失败计数与降级触发。
+    """
     resp = _post_with_retry(url, headers=headers, json=body, stream=True, timeout=300)
     original_status_code = resp.status_code
 
@@ -635,6 +912,9 @@ def _stream_response_openai(url, headers, body, provider, target_model, sem=None
             )
             if input_tokens > 0 or output_tokens > 0 or cache_read_input_tokens > 0 or cache_creation_input_tokens > 0:
                 _track_usage(provider["id"], input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens)
+            # 流式半失败：上游已开始 yield 但中途断开/出错，直接 mark_degraded 该 mapping。
+            if status == "error" and mapping_id:
+                mark_degraded(mapping_id, degradation_duration)
 
     return generate(), resp.status_code, {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
@@ -722,7 +1002,7 @@ def _adapt_minimax_anthropic(body):
     ]
 
 
-def _proxy_anthropic(request_body, provider, target_model, stream, sem=None, client_ip="", start_time=None, model_type="text", source_model="", model_max_tokens=0, role_rules=None):
+def _proxy_anthropic(request_body, provider, target_model, stream, sem=None, client_ip="", start_time=None, model_type="text", source_model="", model_max_tokens=0, role_rules=None, mapping_id=None, degradation_duration=0):
     """直接转发 Anthropic 格式请求到 provider 的 anthropic_url。
 
     full_path=1（默认）：配置的 anthropic_url 原样使用，不拼接任何后缀。
@@ -790,36 +1070,35 @@ def _proxy_anthropic(request_body, provider, target_model, stream, sem=None, cli
         _adapt_minimax_anthropic(body)
 
     if stream:
-        return _stream_response(url, headers, body, provider, target_model, sem, client_ip, start_time, source_model)
+        return _stream_response(url, headers, body, provider, target_model, sem, client_ip, start_time, source_model, mapping_id, degradation_duration)
     else:
-        try:
-            resp = _post_with_retry(url, headers=headers, json=body, timeout=120)
-            resp_json = resp.json()
-            usage = resp_json.get("usage", {})
-            input_tokens = usage.get("input_tokens", 0)
-            output_tokens = usage.get("output_tokens", 0)
-            cache_read_input_tokens = usage.get("cache_read_input_tokens", 0)
-            cache_creation_input_tokens = usage.get("cache_creation_input_tokens", 0)
-            original_code = resp.status_code
-            mapped_code = config.get_mapped_code(original_code, provider["name"])
-            config.add_log(
-                provider=provider["name"], model=target_model, source_model=source_model,
-                input_tokens=input_tokens, output_tokens=output_tokens,
-                status="success" if original_code == 200 else "error",
-                duration_ms=int((time.time() - start_time) * 1000),
-                error_msg="" if original_code == 200 else json.dumps(resp_json, ensure_ascii=False)[:500],
-                request_body=json.dumps(body, ensure_ascii=False),
-                response_body=json.dumps(resp_json, ensure_ascii=False),
-                original_status_code=original_code, mapped_status_code=mapped_code,
-                client_ip=client_ip,
-                cache_read_input_tokens=cache_read_input_tokens,
-                cache_creation_input_tokens=cache_creation_input_tokens,
-            )
-            if original_code == 200:
-                _track_usage(provider.get("id", 0), input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens)
-            return resp.content, mapped_code, {"Content-Type": "application/json"}
-        finally:
-            _release_concurrency(provider["id"], sem)
+        # 非流式：信号量由调用方（handle_proxy_request）统一释放，本函数不再在 finally 中释放，
+        # 避免 except 子句双重释放导致并发计数超出初始值
+        resp = _post_with_retry(url, headers=headers, json=body, timeout=120)
+        resp_json = resp.json()
+        usage = resp_json.get("usage", {})
+        input_tokens = usage.get("input_tokens", 0)
+        output_tokens = usage.get("output_tokens", 0)
+        cache_read_input_tokens = usage.get("cache_read_input_tokens", 0)
+        cache_creation_input_tokens = usage.get("cache_creation_input_tokens", 0)
+        original_code = resp.status_code
+        mapped_code = config.get_mapped_code(original_code, provider["name"])
+        config.add_log(
+            provider=provider["name"], model=target_model, source_model=source_model,
+            input_tokens=input_tokens, output_tokens=output_tokens,
+            status="success" if original_code == 200 else "error",
+            duration_ms=int((time.time() - start_time) * 1000),
+            error_msg="" if original_code == 200 else json.dumps(resp_json, ensure_ascii=False)[:500],
+            request_body=json.dumps(body, ensure_ascii=False),
+            response_body=json.dumps(resp_json, ensure_ascii=False),
+            original_status_code=original_code, mapped_status_code=mapped_code,
+            client_ip=client_ip,
+            cache_read_input_tokens=cache_read_input_tokens,
+            cache_creation_input_tokens=cache_creation_input_tokens,
+        )
+        if original_code == 200:
+            _track_usage(provider.get("id", 0), input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens)
+        return resp.content, mapped_code, {"Content-Type": "application/json"}
 
 
 
@@ -828,8 +1107,11 @@ def _proxy_anthropic(request_body, provider, target_model, stream, sem=None, cli
 
 # ---- 流式响应 ----
 
-def _stream_response(url, headers, body, provider, target_model, sem=None, client_ip="", start_time=None, source_model=""):
-    """返回一个生成器用于 SSE 流式转发（Anthropic 协议直转，原样转发上游 Anthropic SSE）"""
+def _stream_response(url, headers, body, provider, target_model, sem=None, client_ip="", start_time=None, source_model="", mapping_id=None, degradation_duration=0):
+    """返回一个生成器用于 SSE 流式转发（Anthropic 协议直转，原样转发上游 Anthropic SSE）
+
+    alias / cfg 用于流式半失败时（上游在流中途出错，非连接级中断）的失败计数与降级触发。
+    """
     resp = _post_with_retry(url, headers=headers, json=body, stream=True, timeout=300)
     original_status_code = resp.status_code
 
@@ -916,6 +1198,9 @@ def _stream_response(url, headers, body, provider, target_model, sem=None, clien
             )
             if input_tokens > 0 or output_tokens > 0 or cache_read_input_tokens > 0 or cache_creation_input_tokens > 0:
                 _track_usage(provider["id"], input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens)
+            # 流式半失败：上游已开始 yield 但中途断开/出错，直接 mark_degraded 该 mapping。
+            if status == "error" and mapping_id:
+                mark_degraded(mapping_id, degradation_duration)
 
     return generate(), resp.status_code, {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
@@ -1236,7 +1521,7 @@ def _convert_chat_to_responses(chat_json, request_model, response_id):
 
 def _stream_response_openai_to_responses(url, headers, body, provider, target_model,
                                           sem=None, client_ip="", start_time=None,
-                                          source_model="", request_model=""):
+                                          source_model="", request_model="", mapping_id=None, degradation_duration=0):
     """消费上游 Chat Completions SSE 流，实时转换为 Responses API SSE 事件序列。
 
     事件序列：
@@ -1561,6 +1846,9 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
             )
             if input_tokens > 0 or output_tokens > 0:
                 _track_usage(provider["id"], input_tokens, output_tokens)
+            # 流式半失败：上游已开始 yield 但中途断开/出错，直接 mark_degraded 该 mapping。
+            if status == "error" and mapping_id:
+                mark_degraded(mapping_id, degradation_duration)
 
     return generate(), resp.status_code, {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
@@ -1571,11 +1859,9 @@ def handle_openai_responses_request(request_body, client_ip=""):
     流程：
       1. 提取 model / stream
       2. 调用 _convert_responses_to_chat 将 Responses 请求体转为 Chat Completions 格式
-      3. 复用 _resolve_openai_provider 查找 provider / 目标模型
-      4. 计费检查 + 并发信号量
-      5. 调用 _proxy_openai_direct 发送到 openai_url（Chat 端点）
-      6. 根据 stream 标志调用不同的响应转换函数
-      7. 返回 (content, status_code, headers)
+      3. 复用 _resolve_openai_provider 查找候选池（在转换请求体后才解析 provider）
+      4. failover 循环：计费检查 + 并发信号量 + 调用上游 + 响应转换
+      5. 返回 (content, status_code, headers)
     """
     model = request_body.get("model", "")
     stream = request_body.get("stream", False)
@@ -1589,109 +1875,161 @@ def handle_openai_responses_request(request_body, client_ip=""):
         return _error_response_responses("input 字段不能为空", 400)
 
     # 复用 provider 解析逻辑（以转换后的 chat_body 作为请求体，保证图片检测正确）
-    provider, target_model, model_type, model_max_tokens, role_rules = _resolve_openai_provider(chat_body, client_ip)
-    if provider is None:
-        return _error_response_responses(target_model, 404 if "未找到" in target_model or "未配置" in target_model else 429)
+    candidates, error_message = _resolve_openai_provider(chat_body, client_ip)
+    if candidates is None:
+        return _error_response_responses(error_message, 404 if "未找到" in error_message or "未配置" in error_message else 429)
 
-    # 应用模型映射配置的角色替换（developer→system 等，仅对当前 mapping 生效）
-    # 统一在 chat_body 上做一次，后续流式/非流式分支均复用
-    _apply_role_replacement(chat_body, role_rules)
+    cfg = get_degradation_config()
+    attempted = set()  # 已尝试的 mapping id（同一请求内不重复尝试）
+    last_response = None  # 最近一次失败响应，全部尝试完后返回
+    _max_loop_iterations = 100  # 防御性兜底：防止极端退化场景下的无限循环
 
-    start_time = time.time()
-    provider_id = provider.get("id", 0)
-    max_concurrency = provider.get("max_concurrency", 0)
+    for _loop_iter in range(_max_loop_iterations):
+        # 从未尝试过的候选中按降级状态过滤，为空则回退到未过滤列表
+        untried = [c for c in candidates if c["mapping_id"] not in attempted]
+        if not untried:
+            break
+        filtered = _filter_candidates_by_degradation(untried, cfg)
+        if not filtered:
+            break
+        chosen = _pick_weighted_round_robin(filtered, client_ip, model)
+        if chosen is None:
+            break
+        mid = chosen.get("mapping_id")
+        attempted.add(mid)
+        alias = chosen.get("alias")
 
-    # 计费检查
-    billing_check = config.check_provider_billing(provider_id)
-    if not billing_check["allowed"]:
-        return _error_response_responses(
-            f"提供商 '{provider['name']}' 已被限制: {billing_check['reason']}", 429
-        )
-    if billing_check["near_limit"]:
-        print(f"[计费警告] 提供商 '{provider['name']}' 使用量已达 {billing_check['usage_percent']:.0%}")
+        provider = chosen["provider"]
+        target_model = chosen["target_model"]
+        model_type = chosen["model_type"]
+        model_max_tokens = chosen["model_max_tokens"]
+        role_rules = chosen["role_rules"]
+        provider_id = provider.get("id", 0)
+        max_concurrency = provider.get("max_concurrency", 0)
 
-    sem = _get_semaphore(provider_id, max_concurrency)
-    if sem:
-        sem.acquire()
-    _track_request_start(provider_id)
-
-    # 信号量释放标志：避免双重释放
-    # - 非流式：_proxy_openai_direct 内部 finally 总会释放
-    # - 流式：_stream_response_openai_to_responses 的 generate() finally 总会释放
-    # 仅当异常发生在调用之前（acquire 之后到调用之前的代码路径）才由外层兜底释放
-    sem_released = False
-
-    try:
-        if stream:
-            # 流式：构造 Chat SSE 请求 URL + headers
-            url = provider["openai_url"].rstrip("/")
-            if not provider.get("full_path", 1) and not url.endswith("/chat/completions"):
-                url += "/chat/completions"
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {provider['api_key']}",
-            }
-            body = dict(chat_body)
-            body["model"] = target_model
-            if model_type != "multimodal":
-                _strip_images_openai(body)
-            if model_max_tokens > 0 and not body.get("max_tokens"):
-                body["max_tokens"] = model_max_tokens
-            # 流式模式注入 stream_options.include_usage，确保上游在末帧带 usage，
-            # 否则 token 计数始终为 0，Codex CLI 无法显示消耗
-            body["stream"] = True
-            body["stream_options"] = {"include_usage": True}
-            sem_released = True  # generate() 内部 finally 会释放
-            return _stream_response_openai_to_responses(
-                url, headers, body, provider, target_model,
-                sem=sem, client_ip=client_ip, start_time=start_time,
-                source_model=model, request_model=request_model,
+        # 计费检查：超限则跳过（不降级，仅加入 attempted）
+        billing_check = config.check_provider_billing(provider_id)
+        if not billing_check["allowed"]:
+            last_response = _error_response_responses(
+                f"提供商 '{provider['name']}' 已被限制: {billing_check['reason']}", 429
             )
-        else:
-            # 非流式：复用 _proxy_openai_direct 直接转发
-            sem_released = True  # _proxy_openai_direct 内部 finally 会释放
-            content, status_code, headers = _proxy_openai_direct(
-                chat_body, provider, target_model, False,
-                sem=sem, client_ip=client_ip, start_time=start_time,
-                model_type=model_type, source_model=model,
-                model_max_tokens=model_max_tokens,
-            )
-            if status_code >= 400:
-                # 上游返回错误（任何 4xx/5xx），将 Chat 格式错误转为 Responses 格式
-                # 注：_proxy_openai_direct 的非流式分支已在 finally 中释放信号量，这里不再重复释放
-                try:
-                    err_json = json.loads(content.decode("utf-8"))
-                    err_msg = err_json.get("error", {}).get("message", content.decode("utf-8")[:200])
-                except Exception:
-                    err_msg = content.decode("utf-8", errors="replace")[:200]
-                return _error_response_responses(err_msg, status_code)
+            continue
+        if billing_check["near_limit"]:
+            print(f"[计费警告] 提供商 '{provider['name']}' 使用量已达 {billing_check['usage_percent']:.0%}")
 
-            # 上游成功，将 Chat 响应转为 Responses 格式
-            response_id = _generate_response_id()
-            chat_json = json.loads(content.decode("utf-8"))
-            responses_json = _convert_chat_to_responses(chat_json, request_model, response_id)
-            return json.dumps(responses_json, ensure_ascii=False).encode("utf-8"), 200, {"Content-Type": "application/json"}
+        start_time = time.time()
+        sem = _get_semaphore(provider_id, max_concurrency)
+        if sem:
+            sem.acquire()
+        _track_request_start(provider_id)
 
-    except Exception as e:
-        # 仅在信号量尚未被释放时兜底（调用前的代码路径抛错）
-        if not sem_released:
-            _release_concurrency(provider_id, sem)
-        duration_ms = int((time.time() - start_time) * 1000)
-        if isinstance(e, _CONN_ABORT_ERRORS):
-            msg = f"连接中断: {type(e).__name__}"
-            config.add_log(
-                provider=provider["name"], model=target_model, source_model=model,
-                input_tokens=0, output_tokens=0,
-                status="error", duration_ms=duration_ms,
-                error_msg=msg, request_body=json.dumps(request_body, ensure_ascii=False),
-                client_ip=client_ip,
-            )
-            return _error_response_responses(msg, 502)
-        config.add_log(
-            provider=provider["name"], model=target_model, source_model=model,
-            input_tokens=0, output_tokens=0,
-            status="error", duration_ms=duration_ms,
-            error_msg=str(e), request_body=json.dumps(request_body, ensure_ascii=False),
-            client_ip=client_ip,
-        )
-        return _error_response_responses(str(e), 502)
+        # 信号量释放由本处统一负责：
+        # - 非流式：_proxy_openai_direct 不再在内部 finally 释放，由 except/成功/失败响应 路径释放
+        # - 流式：_stream_response_openai_to_responses 在 status>=400 时内部释放，或由 generate() finally 释放；
+        #   仅当 _post_with_retry 抛出异常时由本处 except 释放
+        sem_released = False
+
+        try:
+            if stream:
+                # 流式：按当前候选构造请求体（每个候选可能有不同的角色映射/模型限制）
+                body = dict(chat_body)
+                _apply_role_replacement(body, role_rules)
+                body["model"] = target_model
+                if model_type != "multimodal":
+                    _strip_images_openai(body)
+                if model_max_tokens > 0 and not body.get("max_tokens"):
+                    body["max_tokens"] = model_max_tokens
+                # 流式模式注入 stream_options.include_usage，确保上游在末帧带 usage
+                body["stream"] = True
+                body["stream_options"] = {"include_usage": True}
+
+                url = provider["openai_url"].rstrip("/")
+                if not provider.get("full_path", 1) and not url.endswith("/chat/completions"):
+                    url += "/chat/completions"
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {provider['api_key']}",
+                }
+                # 流式：generate() finally 或 status>=400 分支负责释放
+                # 注意：sem_released = True 必须放在调用之后，否则 _post_with_retry 抛错时
+                # 外层 except 会因 sem_released=True 而跳过信号量兜底释放，导致资源泄漏。
+                response = _stream_response_openai_to_responses(
+                    url, headers, body, provider, target_model,
+                    sem=sem, client_ip=client_ip, start_time=start_time,
+                    source_model=model, request_model=request_model,
+                    mapping_id=mid, degradation_duration=cfg.get("duration", 30),
+                )
+                # 调用返回即代表信号量已被 generate() finally 或 status>=400 分支接管
+                sem_released = True
+            else:
+                # 非流式：_proxy_openai_direct 不再在内部 finally 释放，本处负责释放
+                content, status_code, _ = _proxy_openai_direct(
+                    chat_body, provider, target_model, False,
+                    sem=sem, client_ip=client_ip, start_time=start_time,
+                    model_type=model_type, source_model=model,
+                    model_max_tokens=model_max_tokens,
+                    role_rules=role_rules,
+                    mapping_id=mid, degradation_duration=cfg.get("duration", 30),
+                )
+                # 非流式调用返回即代表不再持有信号量
+                sem_released = True
+                _release_concurrency(provider_id, sem)
+                if status_code >= 400:
+                    # 上游返回错误（任何 4xx/5xx），将 Chat 格式错误转为 Responses 格式
+                    try:
+                        err_json = json.loads(content.decode("utf-8"))
+                        err_msg = err_json.get("error", {}).get("message", content.decode("utf-8")[:200])
+                    except Exception:
+                        err_msg = content.decode("utf-8", errors="replace")[:200]
+                    response = _error_response_responses(err_msg, status_code)
+                else:
+                    # 上游成功，将 Chat 响应转为 Responses 格式
+                    response_id = _generate_response_id()
+                    chat_json = json.loads(content.decode("utf-8"))
+                    responses_json = _convert_chat_to_responses(chat_json, request_model, response_id)
+                    response = (json.dumps(responses_json, ensure_ascii=False).encode("utf-8"), 200, {"Content-Type": "application/json"})
+
+        except Exception as e:
+            # 仅在信号量尚未被释放时兜底（调用前的代码路径抛错）
+            if not sem_released:
+                _release_concurrency(provider_id, sem)
+            duration_ms = int((time.time() - start_time) * 1000)
+            if isinstance(e, _CONN_ABORT_ERRORS):
+                msg = f"连接中断: {type(e).__name__}"
+                config.add_log(
+                    provider=provider["name"], model=target_model, source_model=model,
+                    input_tokens=0, output_tokens=0,
+                    status="error", duration_ms=duration_ms,
+                    error_msg=msg, request_body=json.dumps(request_body, ensure_ascii=False),
+                    client_ip=client_ip,
+                )
+                last_response = _error_response_responses(msg, 502)
+            else:
+                config.add_log(
+                    provider=provider["name"], model=target_model, source_model=model,
+                    input_tokens=0, output_tokens=0,
+                    status="error", duration_ms=duration_ms,
+                    error_msg=str(e), request_body=json.dumps(request_body, ensure_ascii=False),
+                    client_ip=client_ip,
+                )
+                last_response = _error_response_responses(str(e), 502)
+            mark_degraded(mid, cfg.get("duration", 30))
+            continue
+
+        # 成功（含流式已开始）：清除降级状态并返回
+        if _is_success_response(response):
+            clear_degraded(mid)
+            return response
+
+        # 失败响应：降级并继续循环
+        last_response = response
+        mark_degraded(mid, cfg.get("duration", 30))
+        continue
+    else:
+        # 防御性兜底：达到最大循环次数仍未结束，记录并退出
+        print(f"[failover] 警告: 达到最大循环次数 {_max_loop_iterations} 仍未结束，强制退出。model={model}")
+
+    # 所有候选尝试完仍失败
+    if last_response is not None:
+        return last_response
+    return _error_response_responses(f"模型 '{model}' 没有可用的 OpenAI 提供商", 503)

@@ -349,6 +349,11 @@ def api_delete_model(mapping_id):
     return jsonify({"ok": True})
 
 
+@app.route("/api/models/degradation", methods=["GET"])
+def api_get_models_degradation():
+    return jsonify(proxy.get_degradation_status())
+
+
 # ---- Logs API ----
 
 @app.route("/api/logs", methods=["GET"])

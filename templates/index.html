@@ -47,6 +47,11 @@ tr:hover{background:rgba(99,102,241,.05)}
 .badge-anthropic{background:rgba(99,102,241,.15);color:var(--primary)}
 .badge-openai{background:rgba(16,185,129,.15);color:#10b981}
 .badge-warn{background:rgba(245,158,11,.15);color:var(--warn)}
+.badge-degrade{background:rgba(239,68,68,.18);color:#f97316}
+.degradation-bar{display:flex;gap:16px;align-items:center;margin-bottom:14px;padding:12px 14px;background:var(--bg);border:1px solid var(--border);border-radius:8px;flex-wrap:wrap}
+.degradation-bar .item{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text2)}
+.degradation-bar input[type=number]{width:70px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--card);color:var(--text);font-size:13px;text-align:center}
+.degradation-bar .save-info{font-size:12px;color:var(--text2);margin-left:auto}
 .concurrency-bar{display:flex;align-items:center;gap:6px;min-width:100px}
 .concurrency-bar .bar{flex:1;height:6px;background:var(--border);border-radius:3px;overflow:hidden;min-width:40px}
 .concurrency-bar .bar-fill{height:100%;border-radius:3px;transition:width .3s}
@@ -182,8 +187,19 @@ tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
         <button class="btn btn-primary" onclick="openModelModal()">添加映射</button>
       </div>
       <p style="font-size:13px;color:var(--text2);margin-bottom:12px">将请求中的模型名映射到实际的模型和提供商。同一别名可配置多条映射，系统会按优先级加权轮询，并自动选并发最低的提供商。</p>
+      <div class="degradation-bar">
+        <div class="item">
+          <label class="toggle"><input type="checkbox" id="degradation-enabled"><span class="toggle-slider"></span></label>
+          <span>启用服务降级</span>
+        </div>
+        <div class="item">
+          降级持续 <input type="number" id="degradation-duration" value="30" min="1"> 秒
+        </div>
+        <button class="btn btn-primary btn-sm" onclick="saveDegradationSettings()">保存设置</button>
+        <span id="degradation-info" class="save-info"></span>
+      </div>
       <table>
-        <thead><tr><th>别名</th><th>优先级</th><th>目标模型</th><th>模型类型</th><th>max_tokens</th><th>提供商</th><th>角色映射</th><th>状态</th><th>操作</th></tr></thead>
+        <thead><tr><th>别名</th><th>优先级</th><th>目标模型</th><th>模型类型</th><th>max_tokens</th><th>提供商</th><th>角色映射</th><th>状态</th><th>降级状态</th><th>操作</th></tr></thead>
         <tbody id="models-tbody"></tbody>
       </table>
       <div id="models-empty" class="empty" style="display:none">暂无映射，点击上方按钮添加</div>
@@ -474,7 +490,7 @@ function switchTab(name){
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   document.getElementById('panel-'+name).classList.add('active');
   if(name==='providers') loadProviders();
-  if(name==='models') loadModels();
+  if(name==='models'){loadDegradationSettings();loadModels();}
   if(name==='errors') loadErrors();
   if(name==='logs'){loadLogProviders();loadLogs();loadCleanupSettings();}
   if(name==='apikeys') loadApiKeys();
@@ -587,8 +603,39 @@ const ALIAS_PALETTE=[
   '20,184,166','251,146,60','96,165,250','192,132,252','52,211,153','253,186,116',
 ];
 function _aliasColor(idx){return ALIAS_PALETTE[idx%ALIAS_PALETTE.length];}
+// 降级状态缓存：mapping_id -> {degraded, remaining}（后端按 mapping_id 索引）
+let _degradationData={};
+function parseDegradation(resp){
+  // 后端返回 {mapping_id: {degraded, remaining}}；统一归一为 key->obj，key 为字符串
+  const out={};
+  if(!resp)return out;
+  if(Array.isArray(resp)){
+    for(const d of resp){
+      const key=d.id!=null?d.id:(d.alias||d.model);
+      if(key!=null)out[String(key)]=d;
+    }
+    return out;
+  }
+  if(typeof resp==='object'){
+    for(const k of Object.keys(resp)){
+      out[String(k)]=resp[k];
+    }
+  }
+  return out;
+}
+function degradationCell(key){
+  const d=_degradationData[key];
+  if(!d||!d.degraded)return '<span class="badge badge-success">正常</span>';
+  const remaining=d.remaining!=null?Math.max(0,Math.round(d.remaining)):0;
+  return `<span class="badge badge-degrade" data-deg-key="${esc(key)}" data-deg-remaining="${remaining}">降级（剩余 ${remaining}s）</span>`;
+}
 async function loadModels(){
-  const [models,providers]=await Promise.all([fetch(API+'/api/models').then(r=>r.json()),fetch(API+'/api/providers').then(r=>r.json())]);
+  const [models,providers,degRaw]=await Promise.all([
+    fetch(API+'/api/models').then(r=>r.json()),
+    fetch(API+'/api/providers').then(r=>r.json()),
+    fetch(API+'/api/models/degradation').then(r=>r.json()).catch(()=>null),
+  ]);
+  _degradationData=parseDegradation(degRaw);
   const tb=document.getElementById('models-tbody');
   const empty=document.getElementById('models-empty');
   if(!models.length){tb.innerHTML='';empty.style.display='';return}
@@ -607,6 +654,8 @@ async function loadModels(){
     const color=_aliasColor(colorIdx++);
     const pool=byAlias[aliasName].sort((a,b)=>(a.priority||1)-(b.priority||1)||a.id-b.id);
     for(const m of pool){
+      // 降级状态查询键：后端按 mapping_id（即 m.id）返回，每行独立
+      const degKey=String(m.id);
       rows+=`<tr data-alias="${esc(aliasName)}" style="--alias-rgb:${color}">
         <td><span class="alias-badge" style="--alias-rgb:${color}"><span class="alias-color-dot"></span>${esc(m.alias)}</span></td>
         <td>${m.priority!=null?`<span class="badge" style="background:rgba(${color},.35);color:rgb(${color})">${m.priority}</span>`:'<span style="color:var(--text2)">1</span>'}</td>
@@ -616,6 +665,7 @@ async function loadModels(){
         <td>${esc(m.provider_name||'未知')}</td>
         <td>${roleMapCell(m)}</td>
         <td style="white-space:nowrap"><label class="toggle" title="${m.enabled?'点击禁用':'点击启用'}"><input type="checkbox" ${m.enabled?'checked':''} onchange="toggleModel(${m.id},this.checked)"><span class="toggle-slider"></span></label> <span class="badge ${m.enabled?'badge-success':'badge-error'}" style="margin-left:4px">${m.enabled?'启用':'禁用'}</span></td>
+        <td style="white-space:nowrap" data-deg-cell="${esc(degKey)}">${degradationCell(degKey)}</td>
         <td>
           <button class="btn btn-sm" style="background:var(--border);color:var(--text)" onclick="editModel(_dataStore.models[${_store('models',m)}])">编辑</button>
           <button class="btn btn-sm" style="background:rgba(99,102,241,.15);color:#6366f1" onclick="openRoleMapModal(_dataStore.models[${_store('models',m)}])">角色映射</button>
@@ -625,6 +675,37 @@ async function loadModels(){
     }
   }
   tb.innerHTML=rows;
+}
+async function loadDegradationSettings(){
+  try{
+    const s=await(await fetch(API+'/api/settings')).json();
+    const en=s.degradation_enabled;
+    document.getElementById('degradation-enabled').checked= en==='1'||en===1||en===true||String(en).toLowerCase()==='true';
+    document.getElementById('degradation-duration').value=s.degradation_duration||30;
+  }catch(e){}
+}
+async function saveDegradationSettings(){
+  const data={
+    degradation_enabled:document.getElementById('degradation-enabled').checked?'1':'0',
+    degradation_duration:parseInt(document.getElementById('degradation-duration').value)||30,
+  };
+  try{
+    await fetch(API+'/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+    const info=document.getElementById('degradation-info');
+    if(info){info.textContent='已保存';setTimeout(()=>{if(info)info.textContent=''},2000);}
+    refreshDegradation();
+  }catch(e){alert('保存失败');}
+}
+async function refreshDegradation(){
+  try{
+    const degRaw=await(await fetch(API+'/api/models/degradation')).json();
+    _degradationData=parseDegradation(degRaw);
+    // 按 mapping_id（data-deg-cell）就地刷新降级状态单元格，避免整表重渲染
+    document.querySelectorAll('#models-tbody td[data-deg-cell]').forEach(cell=>{
+      const key=cell.getAttribute('data-deg-cell');
+      cell.innerHTML=degradationCell(key);
+    });
+  }catch(e){}
 }
 async function openModelModal(m){
   const providers=await(await fetch(API+'/api/providers')).json();
@@ -1196,6 +1277,13 @@ setInterval(()=>{
         el.querySelector('.label').textContent=c.used+'/'+(max===Infinity?'∞':c.max);
       });
     }).catch(()=>{});
+  }
+},3000);
+
+// 定时刷新模型降级状态（仅当模型映射 tab 激活时）
+setInterval(()=>{
+  if(document.getElementById('panel-models').classList.contains('active')){
+    refreshDegradation();
   }
 },3000);
 </script>

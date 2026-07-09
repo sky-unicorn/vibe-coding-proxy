@@ -521,6 +521,8 @@ def init_db():
         INSERT OR IGNORE INTO settings (key, value) VALUES ('cleanup_retention_days', '7');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('cleanup_interval_hours', '1');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('last_cleanup_time', '');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('degradation_enabled', '0');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('degradation_duration', '30');
 
         CREATE TABLE IF NOT EXISTS provider_billing_config (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -613,6 +615,7 @@ def init_db():
     _migrate_providers_url_to_full_endpoint(conn)
     _migrate_providers_add_full_path(conn)
     _drop_legacy_mcp_image_config(conn)
+    _migrate_degradation_settings(conn)
     conn.close()
 
 
@@ -904,6 +907,32 @@ def get_all_settings():
     rows = conn.execute("SELECT * FROM settings").fetchall()
     conn.close()
     return {r["key"]: r["value"] for r in rows}
+
+
+def get_degradation_config():
+    """获取服务降级配置。
+
+    返回 dict：
+      - enabled: bool，是否启用降级（默认 False，需在 UI 主动打开）。
+      - duration: int，单次降级持续秒数（默认 30，UI 可改）。
+
+    降级语义：单次转发请求在 _post_with_retry 内部重试 3 次仍失败，
+    即按具体 model_mapping（provider+目标模型）粒度标记降级，在 duration 秒内
+    该候选不再被选中（除非全部候选都降级，则回退到原有加权轮询）。
+    任意一次成功立即清除该候选的降级状态。
+    """
+    enabled_raw = get_setting("degradation_enabled", "0")
+    duration_raw = get_setting("degradation_duration", "30")
+    try:
+        duration = int(duration_raw)
+    except (ValueError, TypeError):
+        duration = 30
+    if duration <= 0:
+        duration = 30
+    return {
+        "enabled": enabled_raw not in ("0", "false", "False", ""),
+        "duration": duration,
+    }
 
 
 
@@ -1389,3 +1418,18 @@ def _drop_legacy_mcp_image_config(conn):
     if tables:
         conn.execute("DROP TABLE mcp_image_config")
         conn.commit()
+
+
+def _migrate_degradation_settings(conn):
+    """清理旧版降级配置的残留键，确保降级配置符合设计契约。
+
+    旧版实现曾引入 degradation_failure_threshold 跨请求累积失败计数，
+    但最终设计不需要该字段（_post_with_retry 内部已做 3 次重试，出来即为最终失败）。
+    同时修正默认值：enabled 默认关闭（'0'），duration 默认 30 秒。
+    """
+    # 删除不再使用的键
+    conn.execute("DELETE FROM settings WHERE key='degradation_failure_threshold'")
+    # 确保默认值存在（INSERT OR IGNORE 不覆盖已有值，避免覆盖用户自定义设置）
+    conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('degradation_enabled', '0')")
+    conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('degradation_duration', '30')")
+    conn.commit()
