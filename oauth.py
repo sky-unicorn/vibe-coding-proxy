@@ -13,13 +13,19 @@ import urllib.parse
 import uuid
 import sqlite3
 import os
+import sys
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import request, jsonify, redirect, session, url_for, Response
 
 import config
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy.db")
+# 打包成 exe 时，DB_PATH 必须在 exe 同目录下，详见 config.py 的说明。
+if getattr(sys, "frozen", False):
+    _BASE_DIR = os.path.dirname(sys.executable)
+else:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(_BASE_DIR, "proxy.db")
 
 # ---- PKCE 工具 ----
 

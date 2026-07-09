@@ -1,5 +1,6 @@
 import json
 import secrets
+import sys
 import threading
 import time as _time
 import urllib.parse
@@ -7,6 +8,14 @@ from flask import Flask, request, jsonify, Response, render_template, session, r
 import config
 import proxy
 import oauth
+
+# Windows 控制台默认用 GBK 编码，直接 print 中文会乱码；强制 stdout/stderr 用 UTF-8。
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 app = Flask(__name__)
 config.init_db()
@@ -850,4 +859,6 @@ if __name__ == "__main__":
     print("  OpenAI 代理:    http://localhost:5000/v1")
     print("  Responses 代理: http://localhost:5000/openai")
     print("=" * 50)
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # 打包后必须关闭 debug/reloader：reloader 会 fork 子进程，但 PyInstaller 打包后
+    # 子进程无法找到原入口文件，会立即挂掉。
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)

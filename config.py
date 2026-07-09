@@ -1,12 +1,19 @@
 import sqlite3
 import json
 import os
+import sys
 import secrets
 import threading
 from datetime import datetime, timedelta
 from werkzeug.security import generate_password_hash, check_password_hash
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy.db")
+# 打包成 exe（PyInstaller onefile）后，__file__ 指向临时解压目录 _MEIPASS，
+# 数据库必须放在 exe 同目录下，否则每次启动数据都会丢失。
+if getattr(sys, "frozen", False):
+    _BASE_DIR = os.path.dirname(sys.executable)
+else:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(_BASE_DIR, "proxy.db")
 
 
 def get_conn():
