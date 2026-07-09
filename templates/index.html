@@ -131,6 +131,8 @@ tr:hover{background:rgba(99,102,241,.05)}
 /* 模型映射别名颜色（同名别名行同色，做隐式分组） */
 tr[data-alias]{background:rgba(var(--alias-rgb),.07)}
 tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
+.alias-badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:500;background:rgba(var(--alias-rgb),.2);color:rgb(var(--alias-rgb));gap:6px}
+.alias-color-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:rgb(var(--alias-rgb));flex-shrink:0}
 </style>
 </head>
 <body>
@@ -606,7 +608,7 @@ async function loadModels(){
     const pool=byAlias[aliasName].sort((a,b)=>(a.priority||1)-(b.priority||1)||a.id-b.id);
     for(const m of pool){
       rows+=`<tr data-alias="${esc(aliasName)}" style="--alias-rgb:${color}">
-        <td><code>${esc(m.alias)}</code></td>
+        <td><span class="alias-badge" style="--alias-rgb:${color}"><span class="alias-color-dot"></span>${esc(m.alias)}</span></td>
         <td>${m.priority!=null?`<span class="badge" style="background:rgba(${color},.35);color:rgb(${color})">${m.priority}</span>`:'<span style="color:var(--text2)">1</span>'}</td>
         <td><code>${esc(m.target_model)}</code></td>
         <td>${m.model_type==='multimodal'?'<span class="badge" style="background:#6366f1;color:#fff">多模态</span>':'<span class="badge" style="background:var(--border);color:var(--text)">文本</span>'}</td>
