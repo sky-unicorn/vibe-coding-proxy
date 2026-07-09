@@ -246,7 +246,7 @@ tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
         </select>
       </div>
       <table>
-        <thead><tr><th>时间</th><th>调用IP</th><th>提供商</th><th>调用模型</th><th>目标模型</th><th>输入Token</th><th>输出Token</th><th>耗时</th><th>原始码</th><th>映射码</th><th>状态</th><th>操作</th></tr></thead>
+        <thead><tr><th>时间</th><th>调用IP</th><th>提供商</th><th>调用模型</th><th>目标模型</th><th>入/缓/出(token)</th><th>耗时</th><th>原始码</th><th>映射码</th><th>状态</th><th>操作</th></tr></thead>
         <tbody id="logs-tbody"></tbody>
       </table>
       <div id="logs-empty" class="empty" style="display:none">暂无日志</div>
@@ -813,8 +813,7 @@ async function loadLogs(p){
     <td>${esc(l.provider)}</td>
     <td><code style="font-size:12px">${esc(l.source_model||l.model)}</code></td>
     <td><code style="font-size:12px">${esc(l.model)}</code></td>
-    <td>${l.input_tokens}</td>
-    <td>${l.output_tokens}</td>
+    <td style="font-family:monospace;font-size:12px;white-space:nowrap">${l.input_tokens||0}<span style="color:var(--text2)">/</span>${l.cache_read_input_tokens||0}<span style="color:var(--text2)">/</span>${l.output_tokens||0}</td>
     <td>${(l.duration_ms/1000).toFixed(2)}s</td>
     <td>${origCode?`<span class="badge ${origCode>=400?'badge-error':'badge-success'}">${origCode}</span>`:'-'}</td>
     <td>${mappedCode&&codeChanged?`<span class="badge badge-warn">${mappedCode}</span>`:origCode?`<span class="badge ${origCode>=400?'badge-error':'badge-success'}">${mappedCode||origCode}</span>`:'-'}</td>

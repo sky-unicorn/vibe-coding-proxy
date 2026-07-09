@@ -821,6 +821,9 @@ def _proxy_openai_direct(request_body, provider, target_model, stream, sem=None,
         resp = _post_with_retry(url, headers=headers, json=body, timeout=120)
         resp_json = resp.json()
         usage = resp_json.get("usage", {})
+        # OpenAI 缓存命中 token 位于 prompt_tokens_details.cached_tokens
+        prompt_details = usage.get("prompt_tokens_details") or {}
+        cache_read_input_tokens = prompt_details.get("cached_tokens", 0)
         original_code = resp.status_code
         mapped_code = config.get_mapped_code(original_code, provider["name"])
         config.add_log(
@@ -833,9 +836,10 @@ def _proxy_openai_direct(request_body, provider, target_model, stream, sem=None,
             response_body=json.dumps(resp_json, ensure_ascii=False),
             original_status_code=original_code, mapped_status_code=mapped_code,
             client_ip=client_ip,
+            cache_read_input_tokens=cache_read_input_tokens,
         )
         if original_code == 200:
-            _track_usage(provider.get("id", 0), usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+            _track_usage(provider.get("id", 0), usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0), cache_read_input_tokens)
         return json.dumps(resp_json, ensure_ascii=False).encode("utf-8"), mapped_code, {"Content-Type": "application/json"}
 
 
@@ -890,6 +894,8 @@ def _stream_response_openai(url, headers, body, provider, target_model, sem=None
                         if usage:
                             input_tokens = usage.get("prompt_tokens", 0)
                             output_tokens = usage.get("completion_tokens", 0)
+                            prompt_details = usage.get("prompt_tokens_details") or {}
+                            cache_read_input_tokens = prompt_details.get("cached_tokens", 0)
                     except (json.JSONDecodeError, IndexError):
                         pass
         except _CONN_ABORT_ERRORS:
@@ -909,6 +915,7 @@ def _stream_response_openai(url, headers, body, provider, target_model, sem=None
                 request_body=json.dumps(body, ensure_ascii=False),
                 response_body="\n".join(response_chunks[-50:]),
                 client_ip=client_ip,
+                cache_read_input_tokens=cache_read_input_tokens,
             )
             if input_tokens > 0 or output_tokens > 0 or cache_read_input_tokens > 0 or cache_creation_input_tokens > 0:
                 _track_usage(provider["id"], input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens)
