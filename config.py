@@ -370,23 +370,27 @@ def _migrate_error_mappings(conn):
 
 
 def _migrate_model_mappings(conn):
-    """检查 model_mappings 表是否有 role_mappings 列，若缺少则按迁移规则重建表"""
+    """检查 model_mappings 表是否有 group_name 列，若有则按迁移规则重建表（将 group_name 合并到 alias）"""
     cols = [row[1] for row in conn.execute("PRAGMA table_info(model_mappings)").fetchall()]
-    if "role_mappings" in cols:
-        return  # 已有新结构，无需迁移
+    if "group_name" not in cols:
+        return  # 已迁移（无 group_name 列），无需执行
     # 1. 备份现有数据
     old_rows = conn.execute("SELECT * FROM model_mappings").fetchall()
-    old_col_names = [desc[0] for desc in conn.execute("SELECT * FROM model_mappings LIMIT 1").description] if old_rows else []
+    old_col_names = [desc[0] for desc in conn.execute("SELECT * FROM model_mappings LIMIT 0").description]
+    mm_count_before = len(old_rows)
+    # 统计迁移前悬空 provider_id（完整性校验用）
+    dangling_before = conn.execute(
+        "SELECT COUNT(*) FROM model_mappings WHERE provider_id NOT IN (SELECT id FROM providers)"
+    ).fetchone()[0]
     # 2. 删除旧表
     conn.execute("DROP TABLE model_mappings")
-    # 3. 创建新表（角色映射统一用 JSON 数组存储，支持多条规则）
+    # 3. 创建新表（移除 group_name 列）
     conn.execute("""
         CREATE TABLE model_mappings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             alias TEXT NOT NULL,
             target_model TEXT NOT NULL,
             provider_id INTEGER NOT NULL,
-            group_name TEXT NOT NULL DEFAULT '',
             priority INTEGER NOT NULL DEFAULT 1,
             model_type TEXT NOT NULL DEFAULT 'text',
             max_tokens INTEGER NOT NULL DEFAULT 0,
@@ -395,33 +399,41 @@ def _migrate_model_mappings(conn):
             FOREIGN KEY (provider_id) REFERENCES providers(id)
         )
     """)
-    # 4. 回填数据
-    if old_rows:
-        has_priority = "priority" in old_col_names
-        has_max_tokens = "max_tokens" in old_col_names
-        for row in old_rows:
-            row_dict = dict(zip(old_col_names, row))
-            # 兼容旧版单条角色映射（role_replace_enabled/role_from/role_to）→ 转 JSON 数组
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_model_mappings_alias_enabled ON model_mappings(alias, enabled)")
+    # 4. 回填数据（合并规则：group_name 优先于 alias）
+    for row in old_rows:
+        row_dict = dict(zip(old_col_names, row))
+        old_group = (row_dict.get("group_name") or "").strip()
+        old_alias = (row_dict.get("alias") or "").strip()
+        new_alias = old_group if old_group else old_alias
+        if not new_alias:
+            raise RuntimeError(f"迁移失败：id={row_dict.get('id')} 行 alias 与 group_name 均为空，无法生成对外模型名")
+        # 兼容旧版单条角色映射（role_replace_enabled/role_from/role_to）→ 转 JSON 数组
+        role_mappings = row_dict.get("role_mappings") or "[]"
+        if not role_mappings or role_mappings == "[]":
             rules = []
             if row_dict.get("role_replace_enabled") and row_dict.get("role_from") and row_dict.get("role_to"):
                 rules.append({"from": row_dict["role_from"], "to": row_dict["role_to"]})
-            role_mappings = json.dumps(rules, ensure_ascii=False)
-            conn.execute(
-                "INSERT INTO model_mappings (id, alias, target_model, provider_id, group_name, priority, model_type, max_tokens, enabled, role_mappings) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    row_dict["id"],
-                    row_dict["alias"],
-                    row_dict["target_model"],
-                    row_dict["provider_id"],
-                    row_dict.get("group_name", ""),
-                    row_dict.get("priority", 1) if has_priority else 1,
-                    row_dict.get("model_type", "text"),
-                    row_dict.get("max_tokens", 0) if has_max_tokens else 0,
-                    row_dict.get("enabled", 1),
-                    role_mappings,
-                ),
-            )
+            role_mappings = json.dumps(rules, ensure_ascii=False) if rules else "[]"
+        conn.execute(
+            "INSERT INTO model_mappings (id, alias, target_model, provider_id, priority, model_type, max_tokens, enabled, role_mappings) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (row_dict["id"], new_alias, row_dict["target_model"], row_dict["provider_id"],
+             int(row_dict.get("priority") or 1), row_dict.get("model_type") or "text",
+             int(row_dict.get("max_tokens") or 0), int(row_dict.get("enabled") or 1), role_mappings),
+        )
     conn.commit()
+    # 5. 完整性校验
+    mm_count_after = conn.execute("SELECT COUNT(*) FROM model_mappings").fetchone()[0]
+    dangling_after = conn.execute(
+        "SELECT COUNT(*) FROM model_mappings WHERE provider_id NOT IN (SELECT id FROM providers)"
+    ).fetchone()[0]
+    empty_alias_count = conn.execute("SELECT COUNT(*) FROM model_mappings WHERE alias IS NULL OR alias = ''").fetchone()[0]
+    if mm_count_after != mm_count_before:
+        raise RuntimeError(f"model_mappings 迁移后行数不一致：{mm_count_before} -> {mm_count_after}")
+    if dangling_after != dangling_before:
+        raise RuntimeError(f"model_mappings 迁移后悬空 provider_id 数量变化：{dangling_before} -> {dangling_after}")
+    if empty_alias_count > 0:
+        raise RuntimeError(f"model_mappings 迁移后存在 {empty_alias_count} 条空 alias 记录")
 
 
 def init_db():
@@ -446,7 +458,6 @@ def init_db():
             alias TEXT NOT NULL,
             target_model TEXT NOT NULL,
             provider_id INTEGER NOT NULL,
-            group_name TEXT NOT NULL DEFAULT '',
             priority INTEGER NOT NULL DEFAULT 1,
             model_type TEXT NOT NULL DEFAULT 'text',
             max_tokens INTEGER NOT NULL DEFAULT 0,
@@ -454,6 +465,8 @@ def init_db():
             role_mappings TEXT NOT NULL DEFAULT '[]',
             FOREIGN KEY (provider_id) REFERENCES providers(id)
         );
+
+        CREATE INDEX IF NOT EXISTS idx_model_mappings_alias_enabled ON model_mappings(alias, enabled);
 
         CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -676,32 +689,21 @@ def get_model_mappings():
     rows = conn.execute(
         "SELECT m.*, p.name as provider_name, p.anthropic_url, p.openai_url, p.api_key "
         "FROM model_mappings m LEFT JOIN providers p ON m.provider_id = p.id "
-        "ORDER BY m.group_name ASC, m.priority ASC, m.id ASC"
+        "ORDER BY m.alias ASC, m.priority ASC, m.id ASC"
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
 def get_model_mapping_by_alias(alias):
+    """按别名返回所有启用的映射（多条同名别名即负载均衡池），找不到返回 None。"""
     conn = get_conn()
-    row = conn.execute(
-        "SELECT m.*, p.name as provider_name, p.anthropic_url, p.openai_url, p.api_key, "
-        "p.max_concurrency as provider_max_concurrency, p.full_path "
-        "FROM model_mappings m LEFT JOIN providers p ON m.provider_id = p.id "
-        "WHERE m.alias = ? AND m.enabled = 1 AND p.enabled = 1",
-        (alias,),
-    ).fetchone()
-    if row:
-        conn.close()
-        return dict(row)
-
-    # 没有精确匹配，尝试按 group_name 查找所有匹配项
     rows = conn.execute(
         "SELECT m.*, p.name as provider_name, p.anthropic_url, p.openai_url, p.api_key, "
         "p.max_concurrency as provider_max_concurrency, p.full_path "
         "FROM model_mappings m LEFT JOIN providers p ON m.provider_id = p.id "
-        "WHERE m.group_name = ? AND m.enabled = 1 AND p.enabled = 1 "
-        "ORDER BY m.priority ASC",
+        "WHERE m.alias = ? AND m.enabled = 1 AND p.enabled = 1 "
+        "ORDER BY m.priority ASC, m.id ASC",
         (alias,),
     ).fetchall()
     conn.close()
@@ -710,7 +712,7 @@ def get_model_mapping_by_alias(alias):
     return [dict(r) for r in rows]
 
 
-def add_model_mapping(alias, target_model, provider_id, enabled=True, group_name="", priority=1, model_type="text", max_tokens=0, role_mappings=None):
+def add_model_mapping(alias, target_model, provider_id, enabled=True, priority=1, model_type="text", max_tokens=0, role_mappings=None):
     conn = get_conn()
     c = conn.cursor()
     if role_mappings is None:
@@ -718,8 +720,8 @@ def add_model_mapping(alias, target_model, provider_id, enabled=True, group_name
     elif isinstance(role_mappings, (list, dict)):
         role_mappings = json.dumps(role_mappings, ensure_ascii=False)
     c.execute(
-        "INSERT INTO model_mappings (alias, target_model, provider_id, group_name, priority, model_type, max_tokens, enabled, role_mappings) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (alias, target_model, provider_id, group_name, int(priority), model_type, int(max_tokens), int(enabled), role_mappings),
+        "INSERT INTO model_mappings (alias, target_model, provider_id, priority, model_type, max_tokens, enabled, role_mappings) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (alias, target_model, provider_id, int(priority), model_type, int(max_tokens), int(enabled), role_mappings),
     )
     conn.commit()
     mapping_id = c.lastrowid
@@ -728,7 +730,7 @@ def add_model_mapping(alias, target_model, provider_id, enabled=True, group_name
 
 
 def update_model_mapping(mapping_id, **kwargs):
-    allowed = {"alias", "target_model", "provider_id", "enabled", "group_name", "priority", "model_type", "max_tokens", "role_mappings"}
+    allowed = {"alias", "target_model", "provider_id", "enabled", "priority", "model_type", "max_tokens", "role_mappings"}
     fields = []
     values = []
     for k, v in kwargs.items():

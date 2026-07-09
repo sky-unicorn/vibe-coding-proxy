@@ -328,7 +328,6 @@ def api_add_model():
         target_model=data["target_model"],
         provider_id=data["provider_id"],
         enabled=data.get("enabled", True),
-        group_name=data.get("group_name", ""),
         priority=data.get("priority", 1),
         model_type=data.get("model_type", "text"),
         max_tokens=data.get("max_tokens", 0),

@@ -211,7 +211,7 @@ _active_lock = threading.Lock()
 
 
 # ---- 按客户端隔离的加权轮询 ----
-# {(client_ip, group_name): round_robin_index}
+# {(client_ip, alias): round_robin_index}
 _rr_index = {}
 _rr_lock = threading.Lock()
 
@@ -268,25 +268,6 @@ def get_concurrency_status():
     return result
 
 
-def _pick_least_concurrent(candidates):
-    """从候选项中选并发使用量最小的，返回单个 mapping dict"""
-    best = None
-    best_used = float("inf")
-    conc = get_concurrency_status()
-    for m in candidates:
-        pid = m["provider_id"]
-        max_c = m.get("provider_max_concurrency", 0)
-        if max_c <= 0:
-            # 不限制并发的优先级最高
-            return m
-        c = conc.get(pid, {"used": 0, "max": max_c})
-        used = c["used"]
-        if used < best_used:
-            best_used = used
-            best = m
-    return best or candidates[0]
-
-
 def _build_weighted_sequence(candidates):
     """根据优先级构建加权序列（打乱后返回），高优先级模型出现次数更多"""
     if not candidates:
@@ -305,15 +286,15 @@ def _build_weighted_sequence(candidates):
     return sequence
 
 
-def _pick_weighted_round_robin(candidates, client_ip, group_name):
-    """按客户端 IP 隔离的加权轮询选择"""
+def _pick_weighted_round_robin(candidates, client_ip, alias):
+    """按客户端 IP 和别名隔离的加权轮询选择"""
     sequence = _build_weighted_sequence(candidates)
     if not sequence:
-        return candidates[0]
+        return None
     # 如果序列长度为 1（只有一个模型），直接返回
     if len(sequence) == 1:
         return sequence[0]
-    key = (client_ip, group_name)
+    key = (client_ip, alias)
     with _rr_lock:
         idx = _rr_index.get(key, -1)
         idx = (idx + 1) % len(sequence)
@@ -326,10 +307,10 @@ def handle_proxy_request(request_body, client_ip=""):
     model = request_body.get("model", "")
     stream = request_body.get("stream", False)
 
-    # 查找模型映射
-    mapping = config.get_model_mapping_by_alias(model)
+    # 查找模型映射（新契约：返回 list[dict] 或 None）
+    mappings = config.get_model_mapping_by_alias(model)
     role_rules = []
-    if not mapping:
+    if not mappings:
         # 没有映射，尝试找默认的 anthropic provider 直接转发
         providers = config.get_providers()
         anthropic_providers = [p for p in providers if p["enabled"] and p.get("anthropic_url", "")]
@@ -350,9 +331,9 @@ def handle_proxy_request(request_body, client_ip=""):
             return _error_response(f"未找到模型 '{model}' 的映射，也没有可用的 Anthropic 提供商", 404)
         model_type = "text"
         model_max_tokens = 0
-    elif isinstance(mapping, list):
-        # group 匹配：过滤掉没有 anthropic_url 或计费超限的提供商，再按优先级加权轮询
-        available = [m for m in mapping if m.get("anthropic_url", "") and config.check_provider_billing(m["provider_id"])["allowed"]]
+    else:
+        # 命中映射列表：过滤掉没有 anthropic_url 或计费超限的提供商，再按优先级加权轮询
+        available = [m for m in mappings if m.get("anthropic_url", "") and config.check_provider_billing(m["provider_id"])["allowed"]]
         if not available:
             return _error_response(f"模型 '{model}' 的所有可用 Anthropic 提供商均已超限或不可用", 429)
         # 请求含图片时，优先选择多模态模型；无多模态候选项则回退到全部候选项
@@ -373,30 +354,6 @@ def handle_proxy_request(request_body, client_ip=""):
         model_type = chosen.get("model_type", "text")
         model_max_tokens = chosen.get("max_tokens", 0)
         role_rules = _role_replace_rules(chosen)
-    else:
-        # 单个精确匹配：如果请求含图片但模型不是多模态，尝试从同 group 中找多模态替代
-        if _has_images_anthropic(request_body) and mapping.get("model_type") != "multimodal":
-            alt = config.get_model_mapping_by_alias(mapping.get("group_name", "") or "")
-            if isinstance(alt, list):
-                multimodal = [m for m in alt if m.get("model_type") == "multimodal"
-                              and m.get("anthropic_url", "")
-                              and config.check_provider_billing(m["provider_id"])["allowed"]]
-                if multimodal:
-                    mapping = multimodal[0]
-        if not mapping.get("anthropic_url", ""):
-            return _error_response(f"模型 '{model}' 的提供商未配置 Anthropic URL", 404)
-        provider = {
-            "id": mapping["provider_id"],
-            "name": mapping["provider_name"],
-            "anthropic_url": mapping["anthropic_url"],
-            "api_key": mapping["api_key"],
-            "max_concurrency": mapping.get("provider_max_concurrency", 0),
-            "full_path": mapping.get("full_path", 1),
-        }
-        target_model = mapping["target_model"]
-        model_type = mapping.get("model_type", "text")
-        model_max_tokens = mapping.get("max_tokens", 0)
-        role_rules = _role_replace_rules(mapping)
 
     start_time = time.time()
     provider_id = provider.get("id", 0)
@@ -453,14 +410,13 @@ def _resolve_openai_provider(request_body, client_ip=""):
     (None, error_message, None, None, None) 表示解析失败（调用方按自身错误格式包装）。
     其中 role_rules 是命中的模型映射的「角色映射」规则列表（list[dict]，可能为空）；
     fallback（无映射）场景为 [] 表示不做替换。
-    解析规则与原 handle_openai_proxy_request 完全一致：
+    解析规则：
       - 别名无映射 → 取首个配置了 openai_url 的启用 provider 作兜底
-      - 别名命中 group → 过滤 openai_url + 计费可用项，加权轮询，含图片时优先多模态
-      - 别名精确命中 → 单 provider；非多模态但请求含图片时尝试同 group 多模态替代
+      - 别名命中映射列表 → 过滤 openai_url + 计费可用项，加权轮询，含图片时优先多模态
     """
     model = request_body.get("model", "")
-    mapping = config.get_model_mapping_by_alias(model)
-    if not mapping:
+    mappings = config.get_model_mapping_by_alias(model)
+    if not mappings:
         providers = config.get_providers()
         openai_providers = [p for p in providers if p["enabled"] and p.get("openai_url", "")]
         if openai_providers:
@@ -474,9 +430,9 @@ def _resolve_openai_provider(request_body, client_ip=""):
             }
             return provider, model, "text", 0, []
         return None, f"未找到模型 '{model}' 的映射，也没有可用的 OpenAI 提供商", None, None, None
-    elif isinstance(mapping, list):
-        # group 匹配：过滤掉没有 openai_url 或计费超限的提供商，再按优先级加权轮询
-        available = [m for m in mapping if m.get("openai_url", "") and config.check_provider_billing(m["provider_id"])["allowed"]]
+    else:
+        # 命中映射列表：过滤掉没有 openai_url 或计费超限的提供商，再按优先级加权轮询
+        available = [m for m in mappings if m.get("openai_url", "") and config.check_provider_billing(m["provider_id"])["allowed"]]
         if not available:
             return None, f"模型 '{model}' 的所有可用 OpenAI 提供商均已超限或不可用", None, None, None
         # 请求含图片时，优先选择多模态模型；无多模态候选项则回退到全部候选项
@@ -495,28 +451,6 @@ def _resolve_openai_provider(request_body, client_ip=""):
         }
         return (provider, chosen["target_model"], chosen.get("model_type", "text"), chosen.get("max_tokens", 0),
                 _role_replace_rules(chosen))
-    else:
-        # 单个精确匹配：如果请求含图片但模型不是多模态，尝试从同 group 中找多模态替代
-        if _has_images_openai(request_body) and mapping.get("model_type") != "multimodal":
-            alt = config.get_model_mapping_by_alias(mapping.get("group_name", "") or "")
-            if isinstance(alt, list):
-                multimodal = [m for m in alt if m.get("model_type") == "multimodal"
-                              and m.get("openai_url", "")
-                              and config.check_provider_billing(m["provider_id"])["allowed"]]
-                if multimodal:
-                    mapping = multimodal[0]
-        if not mapping.get("openai_url", ""):
-            return None, f"模型 '{model}' 的提供商未配置 OpenAI URL", None, None, None
-        provider = {
-            "id": mapping["provider_id"],
-            "name": mapping["provider_name"],
-            "openai_url": mapping["openai_url"],
-            "api_key": mapping["api_key"],
-            "max_concurrency": mapping.get("provider_max_concurrency", 0),
-            "full_path": mapping.get("full_path", 1),
-        }
-        return (provider, mapping["target_model"], mapping.get("model_type", "text"), mapping.get("max_tokens", 0),
-                _role_replace_rules(mapping))
 
 
 def handle_openai_proxy_request(request_body, client_ip=""):
