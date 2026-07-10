@@ -1,4 +1,5 @@
 import sqlite3
+import configparser
 import json
 import os
 import sys
@@ -7,6 +8,14 @@ import threading
 from datetime import datetime, timedelta
 from werkzeug.security import generate_password_hash, check_password_hash
 
+# Windows 控制台默认用 GBK 编码，直接 print 中文会乱码；强制 stdout/stderr 用 UTF-8。
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 # 打包成 exe（PyInstaller onefile）后，__file__ 指向临时解压目录 _MEIPASS，
 # 数据库必须放在 exe 同目录下，否则每次启动数据都会丢失。
 if getattr(sys, "frozen", False):
@@ -14,6 +23,56 @@ if getattr(sys, "frozen", False):
 else:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(_BASE_DIR, "proxy.db")
+
+
+# ---- proxy.ini 外部配置 ----
+# 配置文件与 proxy.db 同目录（打包后位于 exe 同目录），用于配置启动端口与默认管理员账号。
+# 文件可选：不存在或某项未配置时使用以下内置默认值，行为与历史版本一致。
+_CONFIG_PATH = os.path.join(_BASE_DIR, "proxy.ini")
+
+_DEFAULT_SERVER_PORT = 5000
+_DEFAULT_ADMIN_USERNAME = "admin"
+_DEFAULT_ADMIN_PASSWORD = "admin123"
+
+
+def _read_ini():
+    """读取 proxy.ini。文件不存在或解析失败时返回空 ConfigParser，由调用方走默认值。"""
+    parser = configparser.ConfigParser(
+        interpolation=None,  # 关闭插值，避免密码中 % 被当作特殊字符
+        inline_comment_prefixes=("#", ";"),
+    )
+    if os.path.exists(_CONFIG_PATH):
+        try:
+            parser.read(_CONFIG_PATH, encoding="utf-8")
+        except Exception as e:
+            print(f"[config] 读取 proxy.ini 失败，使用默认配置: {e}")
+    return parser
+
+
+def get_server_port():
+    """返回服务启动端口。proxy.ini 未配置或非法时返回默认 5000。"""
+    parser = _read_ini()
+    try:
+        port = parser.getint("server", "port", fallback=_DEFAULT_SERVER_PORT)
+    except Exception as e:
+        print(f"[config] 解析 [server].port 失败，使用默认 {_DEFAULT_SERVER_PORT}: {e}")
+        return _DEFAULT_SERVER_PORT
+    if not (1 <= port <= 65535):
+        print(f"[config] [server].port={port} 越界(1-65535)，使用默认 {_DEFAULT_SERVER_PORT}")
+        return _DEFAULT_SERVER_PORT
+    return port
+
+
+def get_default_admin_credentials():
+    """返回 proxy.ini 配置的管理员 (username, password)，未配置时为 admin/admin123。
+
+    作为管理员账户的唯一事实来源：每次启动 init_db() 都会据此校准 admin_users 表，
+    修改 proxy.ini 的账号/密码后重启即生效。
+    """
+    parser = _read_ini()
+    username = parser.get("admin", "username", fallback=_DEFAULT_ADMIN_USERNAME) or _DEFAULT_ADMIN_USERNAME
+    password = parser.get("admin", "password", fallback=_DEFAULT_ADMIN_PASSWORD) or _DEFAULT_ADMIN_PASSWORD
+    return username, password
 
 
 def get_conn():
@@ -603,13 +662,37 @@ def init_db():
     """)
     conn.commit()
 
-    # 创建默认管理员账户（如果不存在）
-    c.execute("SELECT COUNT(*) FROM admin_users")
-    if c.fetchone()[0] == 0:
+    # 同步管理员账户，使其与 proxy.ini 的 [admin] 段保持一致。
+    # 语义：proxy.ini 为唯一事实来源 —— 每次启动都会校准账号与密码。
+    #   - 不存在则创建
+    #   - 用户名相同则按需更新密码（仅当 ini 密码与库中不同才写）
+    #   - 清理掉 ini 之外的残留管理员（用于改用户名）
+    # 未配置 proxy.ini 时使用默认 admin/admin123，行为与历史版本一致。
+    admin_username, admin_password = get_default_admin_credentials()
+    existing = {row["username"]: row for row in c.execute(
+        "SELECT id, username, password_hash FROM admin_users"
+    ).fetchall()}
+    changed = False
+    if admin_username in existing:
+        # 同名账户：用 check_password_hash 判断 ini 密码是否已与库一致，避免无谓刷新
+        if not check_password_hash(existing[admin_username]["password_hash"], admin_password):
+            c.execute(
+                "UPDATE admin_users SET password_hash = ? WHERE username = ?",
+                (generate_password_hash(admin_password), admin_username),
+            )
+            changed = True
+    else:
+        # ini 用户名不存在：新建（保留原账户，稍后统一清理）
         c.execute(
             "INSERT INTO admin_users (username, password_hash, created_at) VALUES (?, ?, ?)",
-            ("admin", generate_password_hash("admin123"), datetime.now().isoformat()),
+            (admin_username, generate_password_hash(admin_password), datetime.now().isoformat()),
         )
+        changed = True
+    # 清理 ini 之外的残留管理员（用于改用户名的场景）
+    stale = [u for u in existing if u != admin_username]
+    for u in stale:
+        c.execute("DELETE FROM admin_users WHERE username = ?", (u,))
+    if stale or changed:
         conn.commit()
 
     _migrate_logs_add_source_model(conn)

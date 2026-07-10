@@ -230,8 +230,9 @@ def _get_issuer():
     try:
         return request.host_url.rstrip("/")
     except RuntimeError:
-        # 不在请求上下文中时返回默认值
-        return "http://localhost:5000"
+        # 不在请求上下文中时，使用 proxy.ini 配置的端口构造默认值
+        import config as _config
+        return f"http://localhost:{_config.get_server_port()}"
 
 
 def require_auth_server_auth(func):

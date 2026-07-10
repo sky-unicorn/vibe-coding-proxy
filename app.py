@@ -852,13 +852,14 @@ _startup_vacuum_thread.start()
 
 
 if __name__ == "__main__":
+    server_port = config.get_server_port()
     print("=" * 50)
     print("  Vibe Coding 服务转发 已启动")
-    print("  Web 管理界面:  http://localhost:5000")
-    print("  Anthropic 代理: http://localhost:5000/anthropic")
-    print("  OpenAI 代理:    http://localhost:5000/v1")
-    print("  Responses 代理: http://localhost:5000/openai")
+    print(f"  Web 管理界面:  http://localhost:{server_port}")
+    print(f"  Anthropic 代理: http://localhost:{server_port}/anthropic")
+    print(f"  OpenAI 代理:    http://localhost:{server_port}/v1")
+    print(f"  Responses 代理: http://localhost:{server_port}/openai")
     print("=" * 50)
     # 打包后必须关闭 debug/reloader：reloader 会 fork 子进程，但 PyInstaller 打包后
     # 子进程无法找到原入口文件，会立即挂掉。
-    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+    app.run(host="0.0.0.0", port=server_port, debug=False, use_reloader=False)
