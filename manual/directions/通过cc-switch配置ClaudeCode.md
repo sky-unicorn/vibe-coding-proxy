@@ -2,10 +2,10 @@
 
 API Key 则是配置代理服务 "API Key" 界面创建的（非提供商大模型的key）
 
-![](C:\Users\liuti\Desktop\ai-api-proxy\manual\directions\ScreenShot_2026-07-10_143847_632.png)
+![](ScreenShot_2026-07-10_143847_632.png)
 
  可选配置项配置如图即可。
 
 模型映射则配置，代理服务为目标模型起的“别名”
 
-![](C:\Users\liuti\Desktop\ai-api-proxy\manual\directions\ScreenShot_2026-07-10_143909_759.png)
+![](ScreenShot_2026-07-10_143909_759.png)
