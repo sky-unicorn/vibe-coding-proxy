@@ -3,6 +3,12 @@
 一个基于 Flask 的多供应商 AI API 代理服务，统一对外暴露 **Anthropic Messages API**、**OpenAI Chat Completions API**、**OpenAI Responses API** 三种接口，底层可对接任意兼容的 LLM 提供商。配套 Web 管理界面，可对提供商、模型映射（含角色映射）、错误码、日志、计费、API Key、OAuth 客户端等进行可视化配置。
 
 ---
+[软件使用手册](manual/directions/软件使用手册.md)
+[通过cc-switch配置Claude Code](manual/directions/通过cc-switch配置Claude Code.md)
+[通过cc-switch配置Codex Cli](manual/directions/通过cc-switch配置Codex Cli.md)
+
+---
+
 
 ## 一、项目作用
 
