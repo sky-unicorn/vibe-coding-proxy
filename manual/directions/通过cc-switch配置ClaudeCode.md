@@ -1,0 +1,11 @@
+请求地址配置成代理服务的 http://127.0.0.1:5000/anthropic（可通过管理界面右上角快速复制）
+
+API Key 则是配置代理服务 "API Key" 界面创建的（非提供商大模型的key）
+
+![](C:\Users\liuti\Desktop\ai-api-proxy\manual\directions\ScreenShot_2026-07-10_143847_632.png)
+
+ 可选配置项配置如图即可。
+
+模型映射则配置，代理服务为目标模型起的“别名”
+
+![](C:\Users\liuti\Desktop\ai-api-proxy\manual\directions\ScreenShot_2026-07-10_143909_759.png)
