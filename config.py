@@ -184,11 +184,19 @@ def _migrate_providers_url_to_full_endpoint(conn):
     改为不拼接后，需把历史 base 路径补全为完整端点：
       - anthropic_url（如 .../anthropic）追加 /v1/messages
       - openai_url（如 .../v4，版本号已在 URL 中）追加 /chat/completions
-    用 PRAGMA user_version 标记确保只执行一次，避免误改用户后续手动填入的非标准端点。
+    用 settings 键 baseline_url_full_endpoint_done='1' 做一次性标记，确保只执行一次，
+    避免误改用户后续手动填入的非标准端点。
+
+    旧版曾用 PRAGMA user_version=1 做此标记，但新版 user_version 由版本迁移框架统一管理
+    （v1 = provider_billing_config 有 cache_read_price_per_million 列），两者语义冲突，
+    故改用 settings 键。过渡时 _baseline_migrate_to_v0 会把旧 user_version>=1 的库
+    迁移为 baseline_url_full_endpoint_done='1'，本函数据此跳过、绝不重改用户端点。
     """
-    user_version = conn.execute("PRAGMA user_version").fetchone()[0]
-    if user_version >= 1:
-        return  # 已执行过此迁移
+    done_row = conn.execute(
+        "SELECT value FROM settings WHERE key = 'baseline_url_full_endpoint_done'"
+    ).fetchone()
+    if done_row and done_row[0] == "1":
+        return  # 已执行过此迁移（settings 键标记）
     rows = conn.execute("SELECT id, anthropic_url, openai_url FROM providers").fetchall()
     for row in rows:
         pid = row["id"]
@@ -204,7 +212,10 @@ def _migrate_providers_url_to_full_endpoint(conn):
         if updates:
             sets = ", ".join(f"{k} = ?" for k in updates)
             conn.execute(f"UPDATE providers SET {sets} WHERE id = ?", (*updates.values(), pid))
-    conn.execute("PRAGMA user_version = 1")
+    # 完成一次性标记：无论是否有行被更新都写入，保证只跑一次
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('baseline_url_full_endpoint_done', '1')"
+    )
     conn.commit()
 
 
@@ -544,8 +555,13 @@ def _migrate_model_mappings(conn):
         raise RuntimeError(f"model_mappings 迁移后存在 {empty_alias_count} 条空 alias 记录")
 
 
-def init_db():
-    conn = get_conn()
+def _create_latest_schema(conn):
+    """用最新 schema 创建所有表（CREATE TABLE IF NOT EXISTS）。
+
+    这是期望 schema 的「单一事实来源」，全新库直接获得最新结构；
+    老库因 IF NOT EXISTS 对已存在表是空操作，差异需通过版本迁移补齐。
+    自检函数 _self_check_schema 会基于此函数派生期望结构做反射对比。
+    """
     c = conn.cursor()
     c.executescript("""
         CREATE TABLE IF NOT EXISTS providers (
@@ -705,28 +721,32 @@ def init_db():
     """)
     conn.commit()
 
-    # 同步管理员账户，使其与 proxy.ini 的 [admin] 段保持一致。
-    # 语义：proxy.ini 为唯一事实来源 —— 每次启动都会校准账号与密码。
-    #   - 不存在则创建
-    #   - 用户名相同则按需更新密码（仅当 ini 密码与库中不同才写）
-    #   - 清理掉 ini 之外的残留管理员（用于改用户名）
-    # 未配置 proxy.ini 时使用默认 admin/admin123，行为与历史版本一致。
+
+def _sync_admin_user(conn):
+    """同步管理员账户，使其与 proxy.ini 的 [admin] 段保持一致。
+
+    语义：proxy.ini 为唯一事实来源 —— 每次启动都会校准账号与密码。
+      - 不存在则创建
+      - 用户名相同则按需更新密码（仅当 ini 密码与库中不同才写）
+      - 清理掉 ini 之外的残留管理员（用于改用户名）
+    未配置 proxy.ini 时使用默认 admin/admin123，行为与历史版本一致。
+    """
     admin_username, admin_password = get_default_admin_credentials()
-    existing = {row["username"]: row for row in c.execute(
+    existing = {row["username"]: row for row in conn.execute(
         "SELECT id, username, password_hash FROM admin_users"
     ).fetchall()}
     changed = False
     if admin_username in existing:
         # 同名账户：用 check_password_hash 判断 ini 密码是否已与库一致，避免无谓刷新
         if not check_password_hash(existing[admin_username]["password_hash"], admin_password):
-            c.execute(
+            conn.execute(
                 "UPDATE admin_users SET password_hash = ? WHERE username = ?",
                 (generate_password_hash(admin_password), admin_username),
             )
             changed = True
     else:
         # ini 用户名不存在：新建（保留原账户，稍后统一清理）
-        c.execute(
+        conn.execute(
             "INSERT INTO admin_users (username, password_hash, created_at) VALUES (?, ?, ?)",
             (admin_username, generate_password_hash(admin_password), datetime.now().isoformat()),
         )
@@ -734,23 +754,239 @@ def init_db():
     # 清理 ini 之外的残留管理员（用于改用户名的场景）
     stale = [u for u in existing if u != admin_username]
     for u in stale:
-        c.execute("DELETE FROM admin_users WHERE username = ?", (u,))
+        conn.execute("DELETE FROM admin_users WHERE username = ?", (u,))
     if stale or changed:
         conn.commit()
 
+
+# ============================================================================
+# Schema 版本号线性迁移框架（Versioned Migration Framework）
+# ============================================================================
+#
+# 版本语义：
+#   v0 = provider_billing_config 表【没有】cache_read_price_per_million 列
+#        （balance 模式下 cache_read 回退到 input 价格的 0.1x 兜底）。
+#   v1 = provider_billing_config 表【有】cache_read_price_per_million 列
+#        （balance 模式下 cache_read 按用户配置的独立价格计费）。
+# 版本边界严格锚定这一列；其余表的结构演进属于 v0 基线建设，不计入版本边界。
+#
+# 流程：init_db -> 全新库直跳 / 老库走 基线(_baseline_migrate_to_v0)
+#       -> 校准(_calibrate_user_version) -> 版本迁移(run_migrations)
+#       -> 自检(_self_check_schema)。
+# ============================================================================
+
+
+# 当前最新 schema 版本号 = _MIGRATIONS 注册表长度。新增迁移时只追加注册表项，勿手改此值。
+_MIGRATIONS = [
+    # (目标版本号, 人类可读描述, 迁移函数)
+    # 第 i 项 (version=N, desc, fn) 表示「把库从 v(N-1) 升到 vN」的迁移；
+    # fn 必须自身幂等（开头做列/索引存在性检测，已存在则直接 return）。
+    (
+        1,
+        "添加缓存命中计费：provider_billing_config 表新增 cache_read_price_per_million 列",
+        _migrate_billing_config_add_cache_read_price,
+    ),
+]
+
+CURRENT_SCHEMA_VERSION = len(_MIGRATIONS)
+
+
+def run_migrations(conn):
+    """按序执行所有 version > user_version 的迁移，每步成功立即递增并 commit。
+
+    用 PRAGMA user_version 做全局单调版本号，只前向执行；保证崩溃后可断点续跑
+    （不会重复执行已完成的步骤）。
+    """
+    current = conn.execute("PRAGMA user_version").fetchone()[0]
+    for target_version, desc, migrate_fn in _MIGRATIONS:
+        if target_version <= current:
+            continue  # 已达到或超过该版本，跳过
+        print(f"[migration] 执行 v{target_version - 1} -> v{target_version}: {desc}")
+        try:
+            migrate_fn(conn)  # 迁移函数内部自管 commit + 幂等 + backup-drop-recreate
+        except Exception:
+            # 捕获后补充定位信息再上抛，便于管理员从控制台快速识别是哪个迁移步骤失败
+            print(f"[migration] 迁移 v{target_version - 1} -> v{target_version} 失败: {desc}")
+            raise
+        conn.execute(f"PRAGMA user_version = {target_version}")
+        conn.commit()
+        current = target_version
+
+
+def _baseline_migrate_to_v0(conn):
+    """把任意老库幂等拉到 v0 基线（在版本框架外、按历史依赖顺序调用）。
+
+    含一次性过渡清污：旧版 _migrate_providers_url_to_full_endpoint 曾用
+    PRAGMA user_version=1 做「URL 补全」标记，与新框架「v1 = cache_read_price 列」
+    语义冲突。过渡时把旧标记迁移到 settings 键 baseline_url_full_endpoint_done='1'，
+    重置 user_version=0，交由 _calibrate_user_version 按实际 schema 重定。
+    过渡用 settings 键 schema_version_framework_initialized 守卫，只执行一次。
+    """
+    # ---- 一次性过渡清污（只跑一次）----
+    inited_row = conn.execute(
+        "SELECT value FROM settings WHERE key = 'schema_version_framework_initialized'"
+    ).fetchone()
+    if not inited_row:
+        # 旧版若 user_version>=1，说明 URL 补全已跑过，迁移该一次性标记到 settings 键
+        old_user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if old_user_version >= 1:
+            conn.execute(
+                "INSERT OR IGNORE INTO settings (key,value) VALUES ('baseline_url_full_endpoint_done','1')"
+            )
+        # 重置 user_version=0（清除旧语义污染，交给校准按实际 schema 重定）
+        conn.execute("PRAGMA user_version = 0")
+        # 写入框架初始化标记，后续启动不再走过渡
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key,value) VALUES ('schema_version_framework_initialized','1')"
+        )
+        conn.commit()
+
+    # ---- v0 基线建设：11 个幂等迁移，按历史依赖顺序调用 ----
+    # 顺序与原 init_db 一致（仅剔除已移入 _MIGRATIONS 的 v0->v1 项），
+    # 保留所有已声明的依赖关系（如 full_path 依赖 url_to_full_endpoint）。
     _migrate_logs_add_source_model(conn)
     _migrate_logs_add_cache_tokens(conn)
     _migrate_provider_usage_add_cache_tokens(conn)
-    _migrate_billing_config_add_cache_read_price(conn)
     _migrate_model_mappings(conn)
     _migrate_error_mappings(conn)
     _migrate_providers_add_disable_reason(conn)
     _migrate_providers_dual_url(conn)
-    _migrate_providers_url_to_full_endpoint(conn)
-    _migrate_providers_add_full_path(conn)
+    _migrate_providers_url_to_full_endpoint(conn)   # 依赖 dual_url；改读 settings 键做一次性守卫
+    _migrate_providers_add_full_path(conn)          # 依赖 url_to_full_endpoint
     _drop_legacy_mcp_image_config(conn)
     _migrate_degradation_settings(conn)
-    conn.close()
+
+
+def _calibrate_user_version(conn):
+    """反射实际 schema，仅前向校准 user_version（只升不降）。
+
+    现有库上一轮已加 cache_read_price_per_million 列（实际已是 v1 实态），但旧代码把
+    user_version 设成了 1（URL 补全旧含义）。过渡清污已重置为 0，此处按实际列存在性
+    重新校准到正确版本，确保 run_migrations 不会误判重跑或漏跑。
+
+    设计说明（只升不降是有意为之）：降版本会触发 backup-drop-recreate 重跑迁移函数，
+    可能误删数据；因此 detected <= current 时绝不降版本。若某版本应有的列缺失
+    （如外部脚本误删列），由 _self_check_schema 兜底报错（fail-closed），错误信息会
+    精确指出缺失的列与疑似遗漏的迁移。
+
+    特征检测范式（新增版本时在此追加对应检测）：
+      - 加列类迁移：用 PRAGMA table_info 检测标志性列是否存在（如本函数对 v1 的检测）。
+      - 新增表类迁移：用 SELECT name FROM sqlite_master WHERE type='table' AND name='新表名'
+        检测表是否存在。注意：PRAGMA table_info 对不存在的表返回空列表，无法区分
+        『表不存在』与『表存在但无该列』，因此新增表迁移务必用 sqlite_master 而非
+        table_info 做特征检测。
+
+    注意：未来新增 v2/v3 等版本时，特征检测必须按版本号升序排列（先检 v1 再检 v2 再检
+    v3），且每条 if 分支必须用赋值语句设置 detected 为该版本号（如 `detected = 2`），不能
+    写成仅布尔判断；否则在 v1+v2 特征同时存在时被低版本分支覆盖，导致校准错位。当前 v1
+    检测已正确书写，新增版本时务必保持此约定。
+    """
+    detected = 0
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(provider_billing_config)").fetchall()]
+    if "cache_read_price_per_million" in cols:
+        detected = 1  # v1 标志列存在；后续每加一个版本，在此追加一个特征列/索引检测
+    current = conn.execute("PRAGMA user_version").fetchone()[0]
+    if detected > current:
+        conn.execute(f"PRAGMA user_version = {detected}")
+        conn.commit()
+
+
+def _self_check_schema(conn):
+    """启动时 schema 自检兜底：把「忘了写迁移」从静默故障变成启动即失败。
+
+    在一个临时内存库上执行 _create_latest_schema，用 PRAGMA table_info/index_list
+    反射出期望结构，再与 proxy.db 实际结构逐表逐列/逐索引对比。期望 schema 永远跟
+    CREATE TABLE 同源，零漂移（不手写第二份 schema 清单）。
+    覆盖「列新增/删除、索引新增」两类最易遗漏的变更。
+    """
+    tmp = sqlite3.connect(":memory:")
+    try:
+        _create_latest_schema(tmp)
+        expected_tables = [r[0] for r in tmp.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()]
+        errors = []
+        for tbl in expected_tables:
+            exp_cols = [r[1] for r in tmp.execute(f"PRAGMA table_info({tbl})").fetchall()]
+            act_cols = [r[1] for r in conn.execute(f"PRAGMA table_info({tbl})").fetchall()]
+            missing = [c for c in exp_cols if c not in act_cols]
+            if missing:
+                errors.append(
+                    f"表 {tbl} 缺少列 {missing}（疑似遗漏版本迁移：改了 CREATE TABLE 但未注册 _MIGRATIONS）"
+                )
+            # 索引检测：排除 sqlite_autoindex_*（PRIMARY KEY/UNIQUE 约束自动产生的索引）。
+            # 原因：_create_latest_schema 的 CREATE TABLE IF NOT EXISTS 不会给老表补 UNIQUE 约束，
+            # 老库若最初无 UNIQUE 约束，内存库（新 schema）有 sqlite_autoindex_*、老库没有，
+            # 笼统对比会把自动索引缺失误报为「遗漏迁移」并硬阻塞启动（回归）。
+            # 排除后自检只对显式索引（CREATE INDEX 产生）做对比，保留对显式索引遗漏的检测能力，
+            # UNIQUE/PRIMARY KEY 约束差异不再误报。
+            exp_idx = [r[1] for r in tmp.execute(f"PRAGMA index_list({tbl})").fetchall()
+                       if not r[1].startswith("sqlite_autoindex_")]
+            act_idx = [r[1] for r in conn.execute(f"PRAGMA index_list({tbl})").fetchall()
+                       if not r[1].startswith("sqlite_autoindex_")]
+            missing_idx = [i for i in exp_idx if i not in act_idx]
+            if missing_idx:
+                errors.append(f"表 {tbl} 缺少索引 {missing_idx}（疑似遗漏迁移）")
+        if errors:
+            raise RuntimeError("Schema 自检失败，检测到遗漏迁移：\n" + "\n".join(errors))
+    finally:
+        tmp.close()
+
+
+def init_db():
+    """初始化数据库：建表、基线迁移、版本迁移、自检、同步管理员账户。
+
+    流程（版本号线性迁移框架）：
+      (a) 全新库检测（CREATE 之前查 providers/logs/settings 是否已存在）
+      (b) CREATE TABLE IF NOT EXISTS 用最新 schema（_create_latest_schema）
+      (c) 全新库：schema 已是最新，直接设 user_version=CURRENT_SCHEMA_VERSION，跳过基线与迁移
+      (d) 老库：基线建设（拉到 v0）-> 校准 user_version -> 版本迁移 run_migrations
+      (e) 启动自检兜底（反射对比期望 schema）
+      (f) 管理员账户同步
+    """
+    conn = get_conn()
+    try:
+        # (a) 全新库检测（CREATE 之前查核心表是否已存在）
+        existing = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('providers','logs','settings')"
+        ).fetchall()]
+        is_fresh = (len(existing) == 0)
+
+        # (b) CREATE TABLE IF NOT EXISTS 用最新 schema
+        _create_latest_schema(conn)
+
+        if is_fresh:
+            # (c) 全新库：schema 已是最新，直接设版本号，跳过基线与迁移。
+            # 全新库的 providers 表由 _create_latest_schema 直接用 full_path=1 的完整端点
+            # 列结构建出，用户后续通过表单填入的就是最终端点（add_provider 默认 full_path=1），
+            # 不存在「历史 base 路径待补全」的场景，因此必须把所有 baseline 一次性 settings
+            # 标记一并写入，防止二次启动走老库分支时误跑 baseline 迁移篡改用户配置的 URL。
+            conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key,value) VALUES ('schema_version_framework_initialized','1')"
+            )
+            # baseline_url_full_endpoint_done：标记 URL 补全已 done，永不重跑
+            # _migrate_providers_url_to_full_endpoint。否则全新安装后配置了非标准自定义端点
+            # （URL 不以 /v1/messages 或 /chat/completions 结尾）的 provider，首次重启走老库
+            # 分支时会因该键缺失而执行迁移，其 endswith 幂等检查只保护已带标准后缀的 URL，
+            # 对自定义端点无保护，会错误追加后缀，永久篡改用户配置的 URL，导致转发失败。
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key,value) VALUES ('baseline_url_full_endpoint_done','1')"
+            )
+            conn.commit()
+        else:
+            # (d) 老库：基线建设（拉到 v0）-> 校准 -> 版本迁移
+            _baseline_migrate_to_v0(conn)
+            _calibrate_user_version(conn)
+            run_migrations(conn)
+
+        # (e) 启动自检兜底（反射对比期望 schema）
+        _self_check_schema(conn)
+
+        # (f) 管理员账户同步
+        _sync_admin_user(conn)
+    finally:
+        conn.close()
 
 
 # ---- Providers CRUD ----
