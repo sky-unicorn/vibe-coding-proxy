@@ -467,6 +467,7 @@ tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
           <div class="form-group"><label>输入价格（/百万Token）</label><input id="bp-input-price" type="number" min="0" step="0.01" placeholder="0.00"></div>
           <div class="form-group"><label>输出价格（/百万Token）</label><input id="bp-output-price" type="number" min="0" step="0.01" placeholder="0.00"></div>
         </div>
+        <div class="form-group"><label>缓存命中价格（/百万Token） <span style="color:var(--text2);font-size:11px">（留空=输入价格的10%）</span></label><input id="bp-cache-read-price" type="number" min="0" step="0.01" placeholder="自动"></div>
       </div>
       <div id="bp-common-billing-fields" style="display:none">
         <div class="form-group"><label>到期时间 <span style="color:var(--text2);font-size:11px">（留空=无期限）</span></label><input id="bp-expiration" type="date"></div>
@@ -1132,6 +1133,8 @@ async function saveBillingPanel(){
       bData.balance=parseFloat(document.getElementById('bp-balance').value)||0;
       bData.input_price_per_million=parseFloat(document.getElementById('bp-input-price').value)||0;
       bData.output_price_per_million=parseFloat(document.getElementById('bp-output-price').value)||0;
+      const crpRaw=document.getElementById('bp-cache-read-price').value;
+      if(crpRaw!==''){bData.cache_read_price_per_million=parseFloat(crpRaw)||0;}
     }
     const expVal=document.getElementById('bp-expiration').value;
     bData.expiration_date=expVal||null;
@@ -1246,6 +1249,7 @@ async function editProviderBilling(pid){
   document.getElementById('bp-balance').value=b?b.balance:'';
   document.getElementById('bp-input-price').value=b?b.input_price_per_million:'';
   document.getElementById('bp-output-price').value=b?b.output_price_per_million:'';
+  document.getElementById('bp-cache-read-price').value=b&&b.cache_read_price_per_million?b.cache_read_price_per_million:'';
   document.getElementById('bp-expiration').value=b&&b.expiration_date?b.expiration_date:'';
   document.getElementById('bp-threshold').value=b?Math.round(b.warning_threshold*100):80;
   document.getElementById('bp-threshold-val').textContent=b?Math.round(b.warning_threshold*100):80;

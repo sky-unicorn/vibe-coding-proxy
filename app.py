@@ -476,7 +476,7 @@ def _validate_billing_data(data):
             data[key] = val
 
     # Validate balance and prices are non-negative
-    for key in ("balance", "input_price_per_million", "output_price_per_million"):
+    for key in ("balance", "input_price_per_million", "output_price_per_million", "cache_read_price_per_million"):
         val = data.get(key, 0)
         try:
             val = float(val)
@@ -518,6 +518,7 @@ def api_create_billing(provider_id):
         balance=data.get("balance", 0),
         input_price_per_million=data.get("input_price_per_million", 0),
         output_price_per_million=data.get("output_price_per_million", 0),
+        cache_read_price_per_million=data.get("cache_read_price_per_million", 0),
         expiration_date=data.get("expiration_date"),
         warning_threshold=data.get("warning_threshold", 0.8),
     )
@@ -546,6 +547,7 @@ def api_update_billing(provider_id):
         balance=data.get("balance", 0),
         input_price_per_million=data.get("input_price_per_million", 0),
         output_price_per_million=data.get("output_price_per_million", 0),
+        cache_read_price_per_million=data.get("cache_read_price_per_million", 0),
         expiration_date=data.get("expiration_date"),
         warning_threshold=data.get("warning_threshold", 0.8),
     )

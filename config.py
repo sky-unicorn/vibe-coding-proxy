@@ -369,6 +369,48 @@ def _migrate_logs_add_cache_tokens(conn):
     conn.commit()
 
 
+def _migrate_billing_config_add_cache_read_price(conn):
+    """检查 provider_billing_config 表是否缺少 cache_read_price_per_million 列，若缺少则按迁移规则重建表"""
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(provider_billing_config)").fetchall()]
+    if "cache_read_price_per_million" in cols:
+        return  # 已有缓存命中价格列，无需迁移
+    # 1. 备份现有数据
+    old_rows = conn.execute("SELECT * FROM provider_billing_config").fetchall()
+    old_col_names = [desc[0] for desc in conn.execute("SELECT * FROM provider_billing_config LIMIT 0").description]
+    # 2. 删除旧表
+    conn.execute("DROP TABLE provider_billing_config")
+    # 3. 创建新表（含 cache_read_price_per_million 列）
+    conn.execute("""
+        CREATE TABLE provider_billing_config (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_id INTEGER NOT NULL UNIQUE,
+            billing_mode TEXT NOT NULL DEFAULT 'request_count',
+            limit_5h INTEGER DEFAULT NULL,
+            limit_week INTEGER DEFAULT NULL,
+            limit_month INTEGER DEFAULT NULL,
+            balance REAL DEFAULT 0,
+            input_price_per_million REAL DEFAULT 0,
+            output_price_per_million REAL DEFAULT 0,
+            cache_read_price_per_million REAL DEFAULT 0,
+            expiration_date TEXT DEFAULT NULL,
+            warning_threshold REAL NOT NULL DEFAULT 0.8,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (provider_id) REFERENCES providers(id)
+        )
+    """)
+    # 4. 回填数据（新列填 0）
+    new_cols = ["id", "provider_id", "billing_mode", "limit_5h", "limit_week", "limit_month",
+                "balance", "input_price_per_million", "output_price_per_million",
+                "cache_read_price_per_million", "expiration_date", "warning_threshold",
+                "created_at", "updated_at"]
+    for row in old_rows:
+        values = [row[c] if c in old_col_names else 0 for c in new_cols]
+        placeholders = ",".join("?" * len(values))
+        conn.execute(f"INSERT INTO provider_billing_config ({','.join(new_cols)}) VALUES ({placeholders})", values)
+    conn.commit()
+
+
 def _migrate_provider_usage_add_cache_tokens(conn):
     """检查 provider_usage 表是否缺少 cache token 列，若缺少则按迁移规则重建表"""
     cols = [row[1] for row in conn.execute("PRAGMA table_info(provider_usage)").fetchall()]
@@ -600,6 +642,7 @@ def init_db():
             balance REAL DEFAULT 0,
             input_price_per_million REAL DEFAULT 0,
             output_price_per_million REAL DEFAULT 0,
+            cache_read_price_per_million REAL DEFAULT 0,
             expiration_date TEXT DEFAULT NULL,
             warning_threshold REAL NOT NULL DEFAULT 0.8,
             created_at TEXT NOT NULL,
@@ -698,6 +741,7 @@ def init_db():
     _migrate_logs_add_source_model(conn)
     _migrate_logs_add_cache_tokens(conn)
     _migrate_provider_usage_add_cache_tokens(conn)
+    _migrate_billing_config_add_cache_read_price(conn)
     _migrate_model_mappings(conn)
     _migrate_error_mappings(conn)
     _migrate_providers_add_disable_reason(conn)
@@ -1249,25 +1293,26 @@ def get_billing_config(provider_id):
 def save_billing_config(provider_id, billing_mode="request_count", limit_5h=None,
                         limit_week=None, limit_month=None, balance=0,
                         input_price_per_million=0, output_price_per_million=0,
-                        expiration_date=None, warning_threshold=0.8):
+                        cache_read_price_per_million=0, expiration_date=None, warning_threshold=0.8):
     """创建或更新 provider 的计费配置"""
     now = datetime.now().isoformat()
     conn = get_conn()
     conn.execute(
         "INSERT INTO provider_billing_config "
         "(provider_id, billing_mode, limit_5h, limit_week, limit_month, balance, "
-        "input_price_per_million, output_price_per_million, expiration_date, "
-        "warning_threshold, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+        "input_price_per_million, output_price_per_million, cache_read_price_per_million, "
+        "expiration_date, warning_threshold, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(provider_id) DO UPDATE SET "
         "billing_mode=excluded.billing_mode, limit_5h=excluded.limit_5h, limit_week=excluded.limit_week, "
         "limit_month=excluded.limit_month, balance=excluded.balance, "
         "input_price_per_million=excluded.input_price_per_million, "
         "output_price_per_million=excluded.output_price_per_million, "
+        "cache_read_price_per_million=excluded.cache_read_price_per_million, "
         "expiration_date=excluded.expiration_date, warning_threshold=excluded.warning_threshold, "
         "updated_at=excluded.updated_at",
         (provider_id, billing_mode, limit_5h, limit_week, limit_month, balance,
-         input_price_per_million, output_price_per_million, expiration_date,
-         warning_threshold, now, now),
+         input_price_per_million, output_price_per_million, cache_read_price_per_million,
+         expiration_date, warning_threshold, now, now),
     )
     conn.commit()
     conn.close()
@@ -1311,10 +1356,11 @@ def increment_provider_usage(provider_id, input_tokens, output_tokens, cache_rea
         )
 
     # balance 模式：计算费用并扣减余额
-    # Anthropic 缓存定价：cache_creation 按全额 input 价格，cache_read 按 0.1x（90%折扣）
+    # Anthropic 缓存定价：cache_creation 按全额 input 价格，cache_read 按配置的缓存命中价格（默认 0.1x input）
     if billing_mode == "balance":
         input_cost = ((input_tokens + cache_creation_input_tokens) / 1_000_000) * config["input_price_per_million"]
-        cache_read_cost = (cache_read_input_tokens / 1_000_000) * config["input_price_per_million"] * 0.1  # 90% discount
+        cache_read_price = config.get("cache_read_price_per_million", 0) or (config["input_price_per_million"] * 0.1)
+        cache_read_cost = (cache_read_input_tokens / 1_000_000) * cache_read_price
         output_cost = (output_tokens / 1_000_000) * config["output_price_per_million"]
         total_cost = input_cost + cache_read_cost + output_cost
         conn.execute(
