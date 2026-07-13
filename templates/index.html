@@ -70,6 +70,11 @@ tr:hover{background:rgba(99,102,241,.05)}
 .form-group input:focus,.form-group select:focus{border-color:var(--primary)}
 .form-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:20px}
 .key-mask{font-family:monospace;letter-spacing:1px}
+.input-with-toggle{position:relative}
+.input-with-toggle input{padding-right:38px !important}
+.input-toggle-btn{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;color:var(--text2);padding:4px;display:flex;align-items:center;justify-content:center;border-radius:4px;transition:color .15s,background .15s}
+.input-toggle-btn:hover{color:var(--text);background:rgba(255,255,255,.05)}
+.input-toggle-btn svg{width:16px;height:16px;display:block}
 .pagination{display:flex;gap:8px;align-items:center;justify-content:center;margin-top:16px;font-size:13px;color:var(--text2)}
 .pagination button{background:var(--card);border:1px solid var(--border);color:var(--text);padding:4px 12px;border-radius:4px;cursor:pointer}
 .pagination button:disabled{opacity:.4;cursor:default}
@@ -321,7 +326,7 @@ tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
     <div class="form-group"><label>名称</label><input id="pf-name" placeholder="如: Anthropic Official"></div>
     <div class="form-group"><label>Anthropic URL</label><input id="pf-anthropic-url" placeholder="完整端点（推荐），如 https://api.anthropic.com/v1/messages。关闭下方「完整路径」开关后可填 base 路径，系统自动拼接 /v1/messages。留空则不转发 Anthropic 协议请求"></div>
     <div class="form-group"><label>OpenAI URL</label><input id="pf-openai-url" placeholder="完整端点（推荐），如 https://api.openai.com/v1/chat/completions。关闭下方「完整路径」开关后可填 base 路径，系统自动拼接 /chat/completions。留空则不转发 OpenAI 协议请求"></div>
-    <div class="form-group"><label>API Key</label><input id="pf-key" type="password" placeholder="sk-ant-..."></div>
+    <div class="form-group"><label>API Key</label><div class="input-with-toggle"><input id="pf-key" type="password" placeholder="sk-ant-..."><button type="button" class="input-toggle-btn" id="pf-key-toggle" onclick="togglePasswordVisibility('pf-key',this)" title="显示/隐藏密钥" aria-label="显示/隐藏密钥"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></button></div></div>
     <div class="form-group"><label>最大并行数</label><input id="pf-concurrency" type="number" placeholder="0 = 不限制" min="0" max="100" value="0"><span style="font-size:11px;color:var(--text2);margin-top:2px;display:block">0 表示不限制并发，超过限制的请求将排队等待（不会断开连接）</span></div>
     <div class="form-group" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
       <label class="toggle"><input type="checkbox" id="pf-full-path" checked onchange="updateUrlPlaceholders()"><span class="toggle-slider"></span></label>
@@ -552,6 +557,7 @@ function openProviderModal(p){
   document.getElementById('pf-anthropic-url').value=p?(p.anthropic_url||''):'';
   document.getElementById('pf-openai-url').value=p?(p.openai_url||''):'';
   document.getElementById('pf-key').value=p?p.api_key:'';
+  resetPasswordToggle('pf-key');
   document.getElementById('pf-concurrency').value=p?(p.max_concurrency||0):0;
   document.getElementById('pf-full-path').checked=p?(p.full_path!=null?!!p.full_path:true):true;
   document.getElementById('pf-enabled').checked=p?p.enabled:true;
@@ -570,7 +576,26 @@ function updateUrlPlaceholders(){
     oai.placeholder='base 路径，如 https://api.openai.com 或 https://api.openai.com/v1。系统自动拼接 /chat/completions。留空则不转发 OpenAI 协议请求';
   }
 }
-function closeProviderModal(){document.getElementById('provider-modal').classList.remove('active')}
+function closeProviderModal(){document.getElementById('provider-modal').classList.remove('active');resetPasswordToggle('pf-key')}
+function togglePasswordVisibility(inputId,btn){
+  const input=document.getElementById(inputId);
+  const isPassword=input.type==='password';
+  input.type=isPassword?'text':'password';
+  btn.innerHTML=isPassword
+    ?'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg>'
+    :'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>';
+  btn.title=isPassword?'隐藏密钥':'显示/隐藏密钥';
+}
+function resetPasswordToggle(inputId){
+  const input=document.getElementById(inputId);
+  if(!input)return;
+  input.type='password';
+  const btn=document.getElementById(inputId+'-toggle');
+  if(btn){
+    btn.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>';
+    btn.title='显示/隐藏密钥';
+  }
+}
 function editProvider(p){openProviderModal(p)}
 async function saveProvider(){
   const id=document.getElementById('provider-edit-id').value;
