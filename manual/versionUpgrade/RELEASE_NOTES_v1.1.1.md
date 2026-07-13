@@ -1,4 +1,4 @@
-# 发布标题（复制到 Release name）
+# 发布标题
 
 ```
 v1.1.1：Vibe Coding 服务转发 支持 proxy.ini 外部配置与缓存命中 Token 展示（Windows 免安装版）
@@ -6,7 +6,7 @@ v1.1.1：Vibe Coding 服务转发 支持 proxy.ini 外部配置与缓存命中 T
 
 ---
 
-# 发布说明（复制到 Describe this release 正文）
+# 发布说明
 
 ## 🎉 Vibe Coding 服务转发 v1.1.1
 
