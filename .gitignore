@@ -3,3 +3,6 @@ proxy.db
 *.sql
 build/**
 dist/**
+**.spec
+proxy.db-shm
+proxy.db-wal
