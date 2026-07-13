@@ -809,9 +809,14 @@ def _proxy_openai_direct(request_body, provider, target_model, stream, sem=None,
     if model_type != "multimodal":
         _strip_images_openai(body)
 
-    # 如果模型配置了 max_tokens 且客户端未指定，使用模型配置值
-    if model_max_tokens > 0 and not body.get("max_tokens"):
-        body["max_tokens"] = model_max_tokens
+    # 模型配置了 max_tokens 时作为上限钳制：客户端未指定则填配置值，
+    # 客户端传入超过配置值则裁剪到配置值，避免 provider 因超限返回 400
+    if model_max_tokens > 0:
+        cur = body.get("max_tokens")
+        if not cur or cur <= 0:
+            body["max_tokens"] = model_max_tokens
+        elif cur > model_max_tokens:
+            body["max_tokens"] = model_max_tokens
 
     if stream:
         return _stream_response_openai(url, headers, body, provider, target_model, sem, client_ip, start_time, source_model, mapping_id, degradation_duration)
@@ -1061,11 +1066,15 @@ def _proxy_anthropic(request_body, provider, target_model, stream, sem=None, cli
     if model_type != "multimodal":
         _strip_images_anthropic(body)
 
-    # 通用兜底：保证 max_tokens 存在且为正整数
-    # Claude Code 在 thinking 模式下不传 max_tokens，而多数 Anthropic 兼容端点要求该字段
-    # 优先使用模型配置的 max_tokens，否则使用默认值 128000
-    if not body.get("max_tokens") or body["max_tokens"] <= 0:
+    # max_tokens 兜底与上限钳制：
+    # - 客户端未传或 <=0：Claude Code 在 thinking 模式下不传 max_tokens，多数 Anthropic 兼容端点要求该字段；
+    #   优先用模型配置值，否则用默认值 128000 兜底。
+    # - 客户端传了超过模型配置值：裁剪到配置值，避免 provider 因超限返回 400
+    cur = body.get("max_tokens")
+    if not cur or cur <= 0:
         body["max_tokens"] = model_max_tokens if model_max_tokens > 0 else 128000
+    elif model_max_tokens > 0 and cur > model_max_tokens:
+        body["max_tokens"] = model_max_tokens
 
     # DeepSeek / MIMO 等兼容端点的思考模式参数适配
     provider_name = provider.get("name", "").lower()
@@ -1944,8 +1953,13 @@ def handle_openai_responses_request(request_body, client_ip=""):
                 body["model"] = target_model
                 if model_type != "multimodal":
                     _strip_images_openai(body)
-                if model_max_tokens > 0 and not body.get("max_tokens"):
-                    body["max_tokens"] = model_max_tokens
+                # 模型 max_tokens 上限钳制
+                if model_max_tokens > 0:
+                    cur = body.get("max_tokens")
+                    if not cur or cur <= 0:
+                        body["max_tokens"] = model_max_tokens
+                    elif cur > model_max_tokens:
+                        body["max_tokens"] = model_max_tokens
                 # 流式模式注入 stream_options.include_usage，确保上游在末帧带 usage
                 body["stream"] = True
                 body["stream_options"] = {"include_usage": True}
