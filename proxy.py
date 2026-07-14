@@ -195,6 +195,28 @@ def _apply_role_replacement(body, rules):
                 msg["role"] = new_role
 
 
+def _apply_reasoning_effort(body, target_model):
+    """按 target_model 启发式映射 reasoning_effort 到上游参数。
+
+    从 body.pop('_codex_reasoning_effort') 取出 _convert_responses_to_chat 暂存的 effort
+    （如 "high"/"medium"/"low"）。无值或非字符串则直接返回（保持请求体干净）。
+
+    映射规则：
+      - DeepSeek/GLM/Kimi 等上游统一写 reasoning_effort=<effort>（cc-switch 的 supports_reasoning_effort 默认路径）。
+      - MiniMax 系列保守跳过：MiniMax 用 enable_thinking 且默认已开启，传无效字段可能触发 400。
+      - 未来可按 provider 配置细化扩展。
+
+    必须在 failover 循环内、target_model 已知后调用（与 _apply_role_replacement 同一位置）。
+    """
+    effort = body.pop("_codex_reasoning_effort", None)
+    if not isinstance(effort, str) or not effort:
+        return
+    model_lower = (target_model or "").lower()
+    if "minimax" in model_lower:
+        return
+    body["reasoning_effort"] = effort
+
+
 def _track_usage(provider_id, input_tokens, output_tokens, cache_read_input_tokens=0, cache_creation_input_tokens=0):
     """Record billing usage. Failure must not affect the response."""
     try:
@@ -804,6 +826,10 @@ def _proxy_openai_direct(request_body, provider, target_model, stream, sem=None,
 
     # 应用模型映射配置的角色替换（只对当前提供商/模型生效）
     _apply_role_replacement(body, role_rules)
+
+    # 透传 reasoning_effort（仅 Responses→Chat 转换的请求体携带 _codex_reasoning_effort 私有键时生效；
+    # 直接 Chat Completions 请求体无此键，调用为空操作，不污染直通路径）
+    _apply_reasoning_effort(body, target_model)
 
     # 文本模型需替换图片内容为文本提示，多模态模型保留图片
     if model_type != "multimodal":
@@ -1458,7 +1484,19 @@ def _convert_responses_to_chat(responses_body):
         else:
             chat_body["tool_choice"] = tc
 
-    # 丢弃 reasoning / previous_response_id / store
+    # 提取 reasoning.effort（如 "high"/"medium"/"low"）。
+    # Codex CLI 会带 reasoning={effort:"high"}，但 Chat Completions 无对应顶层字段。
+    # 此处无法确定 target_model（provider 尚未解析），故暂存到私有键，
+    # 由 handle_openai_responses_request 的 failover 循环在每个候选 body=dict(chat_body)
+    # 后按 target_model 映射为实际参数并删除该私有键。
+    # 下划线前缀防止上游误收。
+    reasoning_obj = responses_body.get("reasoning")
+    if isinstance(reasoning_obj, dict):
+        effort = reasoning_obj.get("effort")
+        if isinstance(effort, str) and effort:
+            chat_body["_codex_reasoning_effort"] = effort
+
+    # 丢弃 previous_response_id / store
     # （Chat API 无对应字段，本代理无状态，不支持响应链持久化）
 
     return chat_body
@@ -1467,20 +1505,42 @@ def _convert_responses_to_chat(responses_body):
 def _convert_chat_to_responses(chat_json, request_model, response_id):
     """将 Chat Completions 非流式响应 JSON 转换为 Responses API 格式。
 
-    映射规则：
-      - choices[0].message.content → output[0].content[{type:"output_text"}]
+    映射规则（与流式 _stream_response_openai_to_responses 保持字段口径一致）：
+      - reasoning：msg.reasoning_content / msg.reasoning → output[0] reasoning 项
+      - choices[0].message.content → message 项 content[{type:"output_text"}]
       - choices[0].message.tool_calls → output 追加 function_call 项
-      - usage → {input_tokens, output_tokens, total_tokens}
-      - id / object / created_at / model / status → 按 Responses 格式构造
+      - call_id 兜底：上游无 id 时合成 call_{response_id}_{i}（与流式对齐）
+      - status：finish_reason=='length' -> 'incomplete' + incomplete_details；否则 'completed'
+      - end_turn：finish_reason=='tool_calls' -> False；否则 True
+      - usage → {input_tokens, output_tokens, output_tokens_details{reasoning_tokens}, total_tokens}
+      - 空输出兜底：output 为空时合成 status=failed 或空 message 项
     返回 dict。
     """
     now = int(time.time())
     choices = chat_json.get("choices", [])
     first = choices[0] if choices else {}
-    msg = first.get("message", {})
+    msg = first.get("message", {}) if isinstance(first, dict) else {}
+    finish_reason = first.get("finish_reason", "") if isinstance(first, dict) else ""
 
     # 构造 output 数组
     output = []
+
+    # reasoning 输出项（推理模型在非流式 message.reasoning_content 中携带推理）
+    reasoning_content = msg.get("reasoning_content")
+    if not reasoning_content:
+        # 兼容 msg.reasoning（字符串或对象）
+        r = msg.get("reasoning")
+        if isinstance(r, str):
+            reasoning_content = r
+        elif isinstance(r, dict):
+            reasoning_content = r.get("content") or r.get("text") or ""
+    if reasoning_content:
+        output.append({
+            "type": "reasoning",
+            "id": response_id + "_rs",
+            "summary": [{"type": "summary_text", "text": reasoning_content}],
+            "status": "completed",
+        })
 
     # 消息文本输出
     text_content = msg.get("content") or ""
@@ -1505,34 +1565,82 @@ def _convert_chat_to_responses(chat_json, request_model, response_id):
     # 工具调用 → function_call 项
     # call_id 用上游 tool_call 的真实 id（客户端下一轮 function_call_output 据此引用）；
     # item.id 用枚举下标保证多个工具调用之间唯一（Chat 非流式响应的 tool_calls 没有 index 字段）。
+    # call_id 兜底：上游无 id 时合成 call_{response_id}_{i}（与流式对齐，确保跨轮唯一）。
     tool_calls = msg.get("tool_calls") or []
     for i, tc in enumerate(tool_calls):
         func = tc.get("function", {})
+        call_id = tc.get("id") or f"call_{response_id}_{i}"
         output.append({
             "type": "function_call",
             "id": f"{response_id}_fc_{i}",
-            "call_id": tc.get("id", f"call_{i}"),
+            "call_id": call_id,
             "name": func.get("name", ""),
             "arguments": func.get("arguments", ""),
         })
 
-    # usage 字段映射
+    # usage 字段映射 + output_tokens_details
     usage = chat_json.get("usage", {})
+    completion_tokens_details = usage.get("completion_tokens_details") or {}
+    reasoning_tokens = completion_tokens_details.get("reasoning_tokens", 0)
     resp_usage = {
         "input_tokens": usage.get("prompt_tokens", 0),
         "output_tokens": usage.get("completion_tokens", 0),
+        "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
         "total_tokens": usage.get("total_tokens", 0),
     }
 
-    return {
+    # status 映射：finish_reason=='length' -> 'incomplete' + incomplete_details
+    if finish_reason == "length":
+        status = "incomplete"
+        incomplete_details = {"reason": "max_output_tokens"}
+    else:
+        status = "completed"
+        incomplete_details = None
+
+    # end_turn：finish_reason=='tool_calls' -> False（codex 需继续 follow_up）；否则 True
+    end_turn = finish_reason != "tool_calls"
+
+    # 空输出兜底
+    if not output:
+        if finish_reason in ("stop", "", None):
+            # 上游返回空输出且无异常 finish_reason，返回 failed 让 codex 走错误路径
+            return {
+                "id": response_id,
+                "object": "response",
+                "created_at": now,
+                "model": request_model,
+                "status": "failed",
+                "output": [],
+                "error": {
+                    "message": "Upstream returned empty output",
+                    "type": "empty_output",
+                    "code": "empty_output",
+                },
+                "usage": resp_usage,
+            }
+        # 其他 finish_reason 合成空 message 项保持 completed/incomplete
+        output.append({
+            "type": "message",
+            "id": response_id + "_msg",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "", "annotations": []}],
+        })
+
+    result = {
         "id": response_id,
         "object": "response",
         "created_at": now,
         "model": request_model,
-        "status": "completed",
+        "status": status,
         "output": output,
         "usage": resp_usage,
+        "end_turn": end_turn,
     }
+    if incomplete_details:
+        result["incomplete_details"] = incomplete_details
+
+    return result
 
 
 def _stream_response_openai_to_responses(url, headers, body, provider, target_model,
@@ -1608,6 +1716,22 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
         tool_calls_acc = {}
         tool_call_order = []  # 按 index 出现顺序记录，便于有序输出
 
+        # ---- reasoning 状态变量 ----
+        reasoning_item_id = response_id + "_rs"
+        reasoning_text = ""
+        reasoning_opened = False
+        reasoning_output_index = None  # reasoning 项的 output_index，opened 时分配
+
+        # ---- finish_reason 捕获 ----
+        finish_reason = None
+
+        # ---- 动态 output_index 计数器 ----
+        # 替换原来 text=0 / tools=1+idx 的硬编码，确保 reasoning/text/tools 交叉场景下 index 连续递增
+        next_output_index = 0
+
+        # ---- usage 详情（reasoning_tokens 等）----
+        usage_data_ref = {}  # 保存最近一次 usage chunk，供 completed 时提取详情
+
         try:
             # 1) response.created
             yield _sse_event("response.created", {
@@ -1644,20 +1768,93 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
                 if usage_data:
                     input_tokens = usage_data.get("prompt_tokens", 0)
                     output_tokens = usage_data.get("completion_tokens", 0)
+                    usage_data_ref = usage_data
 
                 choices = chunk.get("choices", [])
                 if not choices:
                     continue
                 delta = choices[0].get("delta", {})
 
-                # 文本内容 delta
-                content_delta = delta.get("content", "")
-                if content_delta:
-                    if not text_item_opened:
-                        # 首次有文本输出，发送 message 输出项的 added 事件
+                # 捕获 finish_reason
+                fr = choices[0].get("finish_reason")
+                if fr:
+                    finish_reason = fr
+
+                # ---- reasoning_content 分支（在 content 之前处理）----
+                # 兼容多种上游字段名：delta.reasoning_content / delta.reasoning(字符串)
+                reasoning_delta = delta.get("reasoning_content")
+                if not reasoning_delta and isinstance(delta.get("reasoning"), str):
+                    reasoning_delta = delta["reasoning"]
+                if reasoning_delta:
+                    if not reasoning_opened:
+                        # 首次有 reasoning 输出，发送 reasoning 输出项的 added 事件
+                        reasoning_output_index = next_output_index
+                        next_output_index += 1
                         yield _sse_event("response.output_item.added", {
                             "type": "response.output_item.added",
-                            "output_index": 0,
+                            "output_index": reasoning_output_index,
+                            "item": {
+                                "type": "reasoning",
+                                "id": reasoning_item_id,
+                                "summary": [],
+                                "status": "in_progress",
+                            },
+                        })
+                        yield _sse_event("response.reasoning_summary_part.added", {
+                            "type": "response.reasoning_summary_part.added",
+                            "item_id": reasoning_item_id,
+                            "output_index": reasoning_output_index,
+                            "summary_index": 0,
+                            "part": {"type": "summary_text", "text": ""},
+                        })
+                        reasoning_opened = True
+                    reasoning_text += reasoning_delta
+                    yield _sse_event("response.reasoning_summary_text.delta", {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": reasoning_item_id,
+                        "output_index": reasoning_output_index,
+                        "summary_index": 0,
+                        "delta": reasoning_delta,
+                    })
+
+                # ---- 文本内容 delta ----
+                content_delta = delta.get("content", "")
+                if content_delta:
+                    # 若 reasoning 项尚未关闭，先 flush reasoning
+                    if reasoning_opened:
+                        yield _sse_event("response.reasoning_summary_text.done", {
+                            "type": "response.reasoning_summary_text.done",
+                            "item_id": reasoning_item_id,
+                            "output_index": reasoning_output_index,
+                            "summary_index": 0,
+                            "text": reasoning_text,
+                        })
+                        yield _sse_event("response.reasoning_summary_part.done", {
+                            "type": "response.reasoning_summary_part.done",
+                            "item_id": reasoning_item_id,
+                            "output_index": reasoning_output_index,
+                            "summary_index": 0,
+                            "part": {"type": "summary_text", "text": reasoning_text},
+                        })
+                        yield _sse_event("response.output_item.done", {
+                            "type": "response.output_item.done",
+                            "output_index": reasoning_output_index,
+                            "item": {
+                                "type": "reasoning",
+                                "id": reasoning_item_id,
+                                "summary": [{"type": "summary_text", "text": reasoning_text}],
+                                "status": "completed",
+                            },
+                        })
+                        reasoning_opened = False
+
+                    if not text_item_opened:
+                        # 首次有文本输出，发送 message 输出项的 added 事件
+                        text_output_index = next_output_index
+                        next_output_index += 1
+                        yield _sse_event("response.output_item.added", {
+                            "type": "response.output_item.added",
+                            "output_index": text_output_index,
                             "item": {
                                 "type": "message",
                                 "id": msg_item_id,
@@ -1669,24 +1866,87 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
                         yield _sse_event("response.content_part.added", {
                             "type": "response.content_part.added",
                             "item_id": msg_item_id,
-                            "output_index": 0,
+                            "output_index": text_output_index,
                             "content_index": 0,
                             "part": {"type": "output_text", "text": "", "annotations": []},
                         })
                         text_item_opened = True
                         text_item_created = True
+                        # 记住 text 项的 output_index，后续 delta/done 需一致
+                        text_output_index_ref = text_output_index
+                    else:
+                        text_output_index_ref = text_output_index_ref  # 保持已有值
                     full_text += content_delta
                     yield _sse_event("response.output_text.delta", {
                         "type": "response.output_text.delta",
                         "item_id": msg_item_id,
-                        "output_index": 0,
+                        "output_index": text_output_index_ref,
                         "content_index": 0,
                         "delta": content_delta,
                     })
 
-                # 工具调用 delta
+                # ---- 工具调用 delta ----
                 tc_delta = delta.get("tool_calls")
                 if tc_delta:
+                    # 若 reasoning 项尚未关闭，先 flush reasoning
+                    if reasoning_opened:
+                        yield _sse_event("response.reasoning_summary_text.done", {
+                            "type": "response.reasoning_summary_text.done",
+                            "item_id": reasoning_item_id,
+                            "output_index": reasoning_output_index,
+                            "summary_index": 0,
+                            "text": reasoning_text,
+                        })
+                        yield _sse_event("response.reasoning_summary_part.done", {
+                            "type": "response.reasoning_summary_part.done",
+                            "item_id": reasoning_item_id,
+                            "output_index": reasoning_output_index,
+                            "summary_index": 0,
+                            "part": {"type": "summary_text", "text": reasoning_text},
+                        })
+                        yield _sse_event("response.output_item.done", {
+                            "type": "response.output_item.done",
+                            "output_index": reasoning_output_index,
+                            "item": {
+                                "type": "reasoning",
+                                "id": reasoning_item_id,
+                                "summary": [{"type": "summary_text", "text": reasoning_text}],
+                                "status": "completed",
+                            },
+                        })
+                        reasoning_opened = False
+
+                    # 若 text 项尚未关闭，先 flush text（场景 C：文本+工具交叉）
+                    if text_item_opened:
+                        yield _sse_event("response.output_text.done", {
+                            "type": "response.output_text.done",
+                            "item_id": msg_item_id,
+                            "output_index": text_output_index_ref,
+                            "content_index": 0,
+                            "text": full_text,
+                        })
+                        yield _sse_event("response.content_part.done", {
+                            "type": "response.content_part.done",
+                            "item_id": msg_item_id,
+                            "output_index": text_output_index_ref,
+                            "content_index": 0,
+                            "part": {"type": "output_text", "text": full_text, "annotations": []},
+                        })
+                        yield _sse_event("response.output_item.done", {
+                            "type": "response.output_item.done",
+                            "output_index": text_output_index_ref,
+                            "item": {
+                                "type": "message",
+                                "id": msg_item_id,
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [
+                                    {"type": "output_text", "text": full_text, "annotations": []}
+                                ],
+                            },
+                        })
+                        text_item_opened = False
+
                     for tc in tc_delta:
                         idx = tc.get("index", 0)
                         func = tc.get("function", {}) or {}
@@ -1697,16 +1957,21 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
                         if idx not in tool_calls_acc:
                             # 新工具调用，发送 output_item.added(function_call)
                             tc_item_id = f"{response_id}_fc_{idx}"
+                            # call_id 兜底：非 OpenAI 上游首帧常不带 id，合成确保非空
+                            if not tc_id:
+                                tc_id = f"call_{response_id}_{idx}"
+                            fc_output_index = next_output_index
+                            next_output_index += 1
                             tool_calls_acc[idx] = {
                                 "id": tc_item_id,
                                 "call_id": tc_id,
+                                "call_id_synthesized": True,  # 标记标记：合成 id 不被后续真实 id 覆盖
                                 "name": tc_name,
                                 "arguments": "",
                                 "opened": True,
+                                "output_index": fc_output_index,
                             }
                             tool_call_order.append(idx)
-                            # 工具调用输出项的 output_index 在文本项之后递增
-                            fc_output_index = 1 + idx
                             yield _sse_event("response.output_item.added", {
                                 "type": "response.output_item.added",
                                 "output_index": fc_output_index,
@@ -1721,42 +1986,77 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
                             })
                         else:
                             acc = tool_calls_acc[idx]
-                            if tc_id and not acc["call_id"]:
-                                acc["call_id"] = tc_id
+                            # 若已有合成 call_id，保留首个合成 id 不被后续真实 id 覆盖
+                            # （若上游后续帧带了真实 id，则用真实 id 替换合成 id）
+                            if tc_id:
+                                if acc.get("call_id_synthesized"):
+                                    # 合成 id 被真实 id 替换
+                                    acc["call_id"] = tc_id
+                                    acc["call_id_synthesized"] = False
+                                elif not acc["call_id"]:
+                                    acc["call_id"] = tc_id
                             if tc_name and not acc["name"]:
                                 acc["name"] = tc_name
 
                         # arguments 增量
                         if tc_args_delta:
                             tool_calls_acc[idx]["arguments"] += tc_args_delta
-                            fc_output_index = 1 + idx
                             yield _sse_event("response.function_call_arguments.delta", {
                                 "type": "response.function_call_arguments.delta",
                                 "item_id": tool_calls_acc[idx]["id"],
-                                "output_index": fc_output_index,
+                                "output_index": tool_calls_acc[idx]["output_index"],
                                 "delta": tc_args_delta,
                             })
 
-            # 3) 流正常结束：依次关闭各输出项（文本项 → 工具调用项），最后发 completed
+            # 3) 流正常结束：依次关闭各输出项（reasoning → text → tools），最后发 completed
+
+            # 关闭 reasoning 输出项
+            if reasoning_opened:
+                yield _sse_event("response.reasoning_summary_text.done", {
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": reasoning_item_id,
+                    "output_index": reasoning_output_index,
+                    "summary_index": 0,
+                    "text": reasoning_text,
+                })
+                yield _sse_event("response.reasoning_summary_part.done", {
+                    "type": "response.reasoning_summary_part.done",
+                    "item_id": reasoning_item_id,
+                    "output_index": reasoning_output_index,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": reasoning_text},
+                })
+                yield _sse_event("response.output_item.done", {
+                    "type": "response.output_item.done",
+                    "output_index": reasoning_output_index,
+                    "item": {
+                        "type": "reasoning",
+                        "id": reasoning_item_id,
+                        "summary": [{"type": "summary_text", "text": reasoning_text}],
+                        "status": "completed",
+                    },
+                })
+                reasoning_opened = False
+
             # 关闭文本 message 输出项
             if text_item_opened:
                 yield _sse_event("response.output_text.done", {
                     "type": "response.output_text.done",
                     "item_id": msg_item_id,
-                    "output_index": 0,
+                    "output_index": text_output_index_ref,
                     "content_index": 0,
                     "text": full_text,
                 })
                 yield _sse_event("response.content_part.done", {
                     "type": "response.content_part.done",
                     "item_id": msg_item_id,
-                    "output_index": 0,
+                    "output_index": text_output_index_ref,
                     "content_index": 0,
                     "part": {"type": "output_text", "text": full_text, "annotations": []},
                 })
                 yield _sse_event("response.output_item.done", {
                     "type": "response.output_item.done",
-                    "output_index": 0,
+                    "output_index": text_output_index_ref,
                     "item": {
                         "type": "message",
                         "id": msg_item_id,
@@ -1767,12 +2067,12 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
                         ],
                     },
                 })
-                text_item_opened = False  # 文本项已关闭，避免重复关闭
+                text_item_opened = False
 
             # 关闭各工具调用输出项
             for idx in tool_call_order:
                 acc = tool_calls_acc[idx]
-                fc_output_index = 1 + idx
+                fc_output_index = acc["output_index"]
                 yield _sse_event("response.function_call_arguments.done", {
                     "type": "response.function_call_arguments.done",
                     "item_id": acc["id"],
@@ -1794,6 +2094,13 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
 
             # 组装最终 output 数组
             final_output = []
+            if reasoning_text:
+                final_output.append({
+                    "type": "reasoning",
+                    "id": reasoning_item_id,
+                    "summary": [{"type": "summary_text", "text": reasoning_text}],
+                    "status": "completed",
+                })
             if text_item_created:
                 final_output.append({
                     "type": "message",
@@ -1815,22 +2122,75 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
                     "status": "completed",
                 })
 
+            # 空输出兜底：上游只产 reasoning（无 content 无 tool_calls）且 reasoning 已 flush 到 final_output，
+            # 此时 final_output 非空（含 reasoning 项），不算空输出。
+            # 真正的空输出：final_output 为空且无 reasoning_text 且无 full_text 且无 tool_call_order
+            if not final_output and not reasoning_text and not full_text and not tool_call_order:
+                if finish_reason in ("stop", None):
+                    # 上游返回空输出且无异常 finish_reason，发 response.failed 让 codex 走错误路径
+                    yield _sse_event("response.failed", {
+                        "type": "response.failed",
+                        "response": {
+                            "id": response_id,
+                            "object": "response",
+                            "created_at": now,
+                            "model": request_model,
+                            "status": "failed",
+                            "output": [],
+                            "error": {
+                                "message": "Upstream returned empty output",
+                                "type": "empty_output",
+                                "code": "empty_output",
+                            },
+                            "usage": {
+                                "input_tokens": input_tokens,
+                                "output_tokens": output_tokens,
+                                "total_tokens": input_tokens + output_tokens,
+                            },
+                        },
+                    })
+                    # 跳过 response.completed
+                    return
+                # 其他 finish_reason（如 length）走 completed + incomplete
+
             # 4) response.completed
+            # end_turn: finish_reason=='tool_calls' -> False（codex 需继续 follow_up）；否则 True
+            end_turn = finish_reason != "tool_calls" if finish_reason else True
+
+            # status 映射：finish_reason=='length' -> 'incomplete' + incomplete_details
+            if finish_reason == "length":
+                completed_status = "incomplete"
+                incomplete_details = {"reason": "max_output_tokens"}
+            else:
+                completed_status = "completed"
+                incomplete_details = None
+
+            # output_tokens_details: 提取 reasoning_tokens
+            completion_tokens_details = usage_data_ref.get("completion_tokens_details") or {}
+            reasoning_tokens = completion_tokens_details.get("reasoning_tokens", 0)
+
+            completed_response = {
+                "id": response_id,
+                "object": "response",
+                "created_at": now,
+                "model": request_model,
+                "status": completed_status,
+                "output": final_output,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
+                    "total_tokens": input_tokens + output_tokens,
+                },
+            }
+            if end_turn is not None:
+                completed_response["end_turn"] = end_turn
+            if incomplete_details:
+                completed_response["incomplete_details"] = incomplete_details
+
             yield _sse_event("response.completed", {
                 "type": "response.completed",
-                "response": {
-                    "id": response_id,
-                    "object": "response",
-                    "created_at": now,
-                    "model": request_model,
-                    "status": "completed",
-                    "output": final_output,
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "total_tokens": input_tokens + output_tokens,
-                    },
-                },
+                "response": completed_response,
             })
 
         except GeneratorExit:
@@ -1951,6 +2311,8 @@ def handle_openai_responses_request(request_body, client_ip=""):
                 body = dict(chat_body)
                 _apply_role_replacement(body, role_rules)
                 body["model"] = target_model
+                # 透传 reasoning_effort（Codex CLI 的 model_reasoning_effort=high 在 _convert_responses_to_chat 已暂存到私有键）
+                _apply_reasoning_effort(body, target_model)
                 if model_type != "multimodal":
                     _strip_images_openai(body)
                 # 模型 max_tokens 上限钳制

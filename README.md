@@ -360,6 +360,8 @@ Codex CLI 会自动请求 `OPENAI_BASE_URL/responses`（即 `http://localhost:50
 
 **流式响应**会按 Responses SSE 事件序列输出（`response.created` → `response.output_item.added` → `response.output_text.delta` → … → `response.completed`），其中**工具调用作为独立的 `function_call` output_item 发送**，确保 Codex CLI 能正确解析为结构化工具调用。同时系统会自动注入 `stream_options.include_usage`，保证末帧带回 token 用量。
 
+**推理（reasoning）透传**：Codex 在 `model_reasoning_effort` 配置时，代理会按上游目标模型自动把 effort 映射为合适的 `reasoning_effort` 参数透传给上游；上游返回的 `reasoning_content` 流式字段会被转换为 `response.reasoning_summary_*` 事件序列透传给 Codex。建议在 Codex 配置中开启 `disable_response_storage = true`，避免依赖 OpenAI 的服务端存储。详细的 `~/.codex/config.toml` 配置与注意事项见 [通过 cc-switch 配置 Codex CLI](manual/directions/通过cc-switch配置CodexCli.md)。
+
 也可直接用 curl 测试：
 
 ```bash
