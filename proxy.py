@@ -1,6 +1,7 @@
 import hashlib
 import inspect
 import json
+import queue
 import re
 import time
 import random
@@ -16,6 +17,17 @@ _CONN_ABORT_ERRORS = (_ReqConnError, ChunkedEncodingError, _ReqTimeout, Connecti
 _RETRY_MAX_ATTEMPTS = 3        # 最多重试次数（首次失败后最多再重试 3 次，总请求数 ≤ 4）
 _RETRY_MAX_DURATION = 5.0      # 单次请求耗时上限（秒）：超过则不再重试，避免对已处理很久的错误做无谓重试
 _RETRY_DELAY = 1.0             # 重试间隔（秒）
+
+# Responses 流式路径 SSE 心跳间隔（秒）。
+# 上游 reasoning 阶段可能长时间不产出任何数据，代理在此期间向 codex 发送 response.ping
+# 事件保活，防止 codex SSE 客户端的 idle timeout（硬上限 300s）触发断连（表现为请求成功但卡死）。
+# 关键：必须发"真正的 SSE event"，不能用 `:` 注释行 —— codex 用 eventsource_stream 解析 SSE，
+# 注释行会被丢弃、不重置 idle timeout；response.ping 事件让 stream.next() 返回从而重置计时。
+_SSE_KEEPALIVE_INTERVAL = 5
+
+# 后台读取线程与主生成器之间的 Queue 哨兵
+_UPSTREAM_DONE = object()    # 上游流正常结束
+_UPSTREAM_ERROR = object()   # 上游读取异常（后跟 (exception,) 元组）
 
 
 def _post_with_retry(url, max_retries=_RETRY_MAX_ATTEMPTS, retry_delay=_RETRY_DELAY, retry_max_duration=_RETRY_MAX_DURATION, **kwargs):
@@ -1739,6 +1751,22 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
         # ---- usage 详情（reasoning_tokens 等）----
         usage_data_ref = {}  # 保存最近一次 usage chunk，供 completed 时提取详情
 
+        # ---- 后台读取线程 + Queue：打破 iter_lines 阻塞，使上游静默期能发 SSE 心跳 ----
+        # 上游 reasoning 阶段可能数十秒不产出任何数据，原 for line in resp.iter_lines() 会
+        # 阻塞主生成器导致 codex 收不到任何事件而 idle timeout 断连。改为后台线程读上游、
+        # 主生成器从 Queue 带超时拉取，超时即发 SSE 注释心跳保活。
+        line_queue = queue.Queue()
+
+        def _upstream_reader():
+            """后台线程：消费上游 SSE 行并投递到 Queue；结束/异常通过哨兵通知主生成器"""
+            try:
+                for line in resp.iter_lines():
+                    line_queue.put(line)
+            except BaseException as e:
+                line_queue.put((_UPSTREAM_ERROR, e))
+                return
+            line_queue.put(_UPSTREAM_DONE)
+
         try:
             # 1) response.created
             yield _sse_event("response.created", {
@@ -1754,8 +1782,30 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
                 },
             })
 
-            # 2) 读取上游 Chat SSE 流
-            for line in resp.iter_lines():
+            # 启动后台读取线程
+            reader_thread = threading.Thread(target=_upstream_reader, daemon=True)
+            reader_thread.start()
+
+            # 2) 读取上游 Chat SSE 流（从 Queue 拉取，静默期发 SSE 心跳保活）
+            while True:
+                try:
+                    item = line_queue.get(timeout=_SSE_KEEPALIVE_INTERVAL)
+                except queue.Empty:
+                    # 上游静默期：发 response.ping 事件保活。
+                    # codex 用 eventsource_stream 解析 SSE，注释行（`: ...`）会被丢弃、不重置
+                    # idle timeout（硬上限 300s）；必须发"真正的 SSE event"让 stream.next() 返回，
+                    # codex 才会重置 idle timeout。response.ping 是 OpenAI 官方心跳事件，codex
+                    # 解析成功后归入 process_responses_event 的 `_ =>` unhandled 分支静默忽略。
+                    yield _sse_event("response.ping", {"type": "response.ping"})
+                    continue
+
+                if item is _UPSTREAM_DONE:
+                    break
+                if isinstance(item, tuple) and item and item[0] is _UPSTREAM_ERROR:
+                    # 后台线程捕获的异常在主线程重新抛出，由下方 except 统一处理（与原直接读取语义一致）
+                    raise item[1]
+
+                line = item
                 if not line:
                     continue
                 decoded = line.decode("utf-8", errors="replace")
@@ -2213,6 +2263,11 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
             # 仅清理资源，不 yield（避免在 GeneratorExit 上下文中 yield 抛 RuntimeError）
             try:
                 resp.close()
+            except Exception:
+                pass
+            # 等待后台读取线程退出（resp.close() 会令其 iter_lines 抛错退出，join 仅作兜底）
+            try:
+                reader_thread.join(timeout=2)
             except Exception:
                 pass
             _release_concurrency(provider["id"], sem)
