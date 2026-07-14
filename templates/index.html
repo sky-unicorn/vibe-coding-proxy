@@ -359,16 +359,41 @@ tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
       <label class="toggle"><input type="checkbox" id="mf-enabled" checked><span class="toggle-slider"></span></label>
       <span style="font-size:13px">启用</span>
     </div>
-    <div class="form-group" style="display:flex;align-items:center;gap:8px">
-      <label class="toggle"><input type="checkbox" id="mf-reasoning" checked><span class="toggle-slider"></span></label>
-      <span style="font-size:13px">透传思考强度参数（<code>reasoning_effort</code>）</span>
-    </div>
-    <div style="font-size:11px;color:var(--text2);margin-top:-4px;margin-bottom:8px">
-      开启后，调用方传来的思考强度（如 codex 的 <code>reasoning_effort=high</code>）会作为 <code>reasoning_effort</code> 原值透传给该上游；关闭则保守跳过（不发该字段）。<b>兼容性参考</b>：GLM/DeepSeek 原生认此字段；MiniMax 接受但不调深度；火山/讯飞/Kimi 参数名不同，传过去多半被上游忽略（不报错），默认开启，若实测出现 400 再关闭。值 <code>low/medium/high</code> 不做翻译。
-    </div>
     <div class="form-actions">
       <button class="btn" style="background:var(--border);color:var(--text)" onclick="closeModelModal()">取消</button>
       <button class="btn btn-primary" onclick="saveModel()">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- Codex 配置 Modal（独立弹窗，管理 Responses->Chat 转换的思考相关开关） -->
+<div class="modal-overlay" id="codex-config-modal">
+  <div class="modal" style="width:520px">
+    <h3>Codex 配置</h3>
+    <input type="hidden" id="cf-mapping-id">
+    <p style="font-size:12px;color:var(--text2);margin-bottom:16px">仅作用于 codex CLI 走的 Responses->Chat 转换路径（Claude Code 走 Anthropic 直转不受影响）。</p>
+
+    <!-- 透传思考强度参数 -->
+    <div class="form-group" style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+      <label class="toggle"><input type="checkbox" id="cf-reasoning" checked><span class="toggle-slider"></span></label>
+      <span style="font-size:13px">透传思考强度参数（<code>reasoning_effort</code>）</span>
+    </div>
+    <div style="font-size:11px;color:var(--text2);margin-top:-4px;margin-bottom:16px">
+      开启后，调用方传来的思考强度（如 codex 的 <code>reasoning_effort=high</code>）作为 <code>reasoning_effort</code> 原值透传给上游；关闭则保守跳过（不发该字段）。<b>兼容性参考</b>：GLM/DeepSeek 原生认此字段；MiniMax 接受但不调深度；火山/讯飞/Kimi 参数名不同，传过去多半被忽略（不报错）。默认开启，若实测出现 400 再关闭。值 <code>low/medium/high</code> 不做翻译。
+    </div>
+
+    <!-- 思考链注入 -->
+    <div class="form-group" style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+      <label class="toggle"><input type="checkbox" id="cf-think"><span class="toggle-slider"></span></label>
+      <span style="font-size:13px">思考链注入（<code>&lt;think&gt;...&lt;/think&gt;</code>）</span>
+    </div>
+    <div style="font-size:11px;color:var(--text2);margin-top:-4px;margin-bottom:8px">
+      开启后，codex 回传的历史 reasoning 会以 <code>&lt;think&gt;...&lt;/think&gt;</code> 形式注入对应 assistant 消息 content，保持思考链连续。<b>MiniMax-M3 必需</b>（Interleaved Thinking，否则多轮工具调用后模型决策退化、不再调工具）；DeepSeek/GLM/Kimi 等把 <code>&lt;think&gt;</code> 当普通文本，无害。默认关闭，仅 MiniMax 等依赖思考链回传的上游需开启。
+    </div>
+
+    <div class="form-actions">
+      <button class="btn" style="background:var(--border);color:var(--text)" onclick="closeCodexConfigModal()">取消</button>
+      <button class="btn btn-primary" onclick="saveCodexConfig()">保存</button>
     </div>
   </div>
 </div>
@@ -701,6 +726,7 @@ async function loadModels(){
         <td style="white-space:nowrap" data-deg-cell="${esc(degKey)}">${degradationCell(degKey)}</td>
         <td>
           <button class="btn btn-sm" style="background:var(--border);color:var(--text)" onclick="editModel(_dataStore.models[${_store('models',m)}])">编辑</button>
+          <button class="btn btn-sm" style="background:rgba(16,185,129,.15);color:#10b981" onclick="openCodexConfigModal(_dataStore.models[${_store('models',m)}])">Codex配置</button>
           <button class="btn btn-sm" style="background:rgba(99,102,241,.15);color:#6366f1" onclick="openRoleMapModal(_dataStore.models[${_store('models',m)}])">角色映射</button>
           <button class="btn btn-danger btn-sm" onclick="delModel(${m.id})">删除</button>
         </td>
@@ -752,7 +778,6 @@ async function openModelModal(m){
   document.getElementById('mf-max-tokens').value=m?m.max_tokens:0;
   document.getElementById('mf-provider').value=m?m.provider_id:(providers[0]?.id||'');
   document.getElementById('mf-enabled').checked=m?m.enabled:true;
-  document.getElementById('mf-reasoning').checked=m?!!m.reasoning_effort_supported:true;
   document.getElementById('model-modal').classList.add('active');
 }
 function closeModelModal(){document.getElementById('model-modal').classList.remove('active')}
@@ -767,13 +792,31 @@ async function saveModel(){
     max_tokens:parseInt(document.getElementById('mf-max-tokens').value)||0,
     provider_id:parseInt(document.getElementById('mf-provider').value),
     enabled:document.getElementById('mf-enabled').checked,
-    reasoning_effort_supported:document.getElementById('mf-reasoning').checked,
   };
   if(id) await fetch(API+'/api/models/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
   else await fetch(API+'/api/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
   closeModelModal();loadModels();
 }
 async function delModel(id){if(!confirm('确定删除？'))return;await fetch(API+'/api/models/'+id,{method:'DELETE'});loadModels();}
+
+// Codex 配置弹窗（管理 Responses->Chat 转换的思考相关开关）
+function openCodexConfigModal(m){
+  document.getElementById('cf-mapping-id').value=m?m.id:'';
+  document.getElementById('cf-reasoning').checked=m?!!m.reasoning_effort_supported:true;
+  document.getElementById('cf-think').checked=m?!!m.think_injection:false;
+  document.getElementById('codex-config-modal').classList.add('active');
+}
+function closeCodexConfigModal(){document.getElementById('codex-config-modal').classList.remove('active')}
+async function saveCodexConfig(){
+  const id=document.getElementById('cf-mapping-id').value;
+  if(!id)return;
+  const data={
+    reasoning_effort_supported:document.getElementById('cf-reasoning').checked,
+    think_injection:document.getElementById('cf-think').checked,
+  };
+  await fetch(API+'/api/models/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+  closeCodexConfigModal();loadModels();
+}
 
 // 角色映射弹窗（支持多条规则）
 function openRoleMapModal(m){

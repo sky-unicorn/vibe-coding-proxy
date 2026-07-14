@@ -634,6 +634,88 @@ def _migrate_model_mappings_add_reasoning(conn):
         raise RuntimeError(f"model_mappings 迁移后悬空 provider_id 数量变化：{dangling_before} -> {dangling_after}")
 
 
+def _migrate_model_mappings_add_think_injection(conn):
+    """v2->v3：model_mappings 表新增 think_injection 列，默认 0（关闭/不注入 <think>）。
+
+    0 = 不注入：reasoning item 在 Responses->Chat 转换时按原行为 continue 丢弃。
+    1 = 注入：reasoning 文本以 <think>...</think> 形式 prepend 到对应 assistant 消息 content 前缀
+        （MiniMax-M3 Interleaved Thinking 必需；其他上游把 <think> 当普通文本，无害）。
+
+    严格遵循 SQLite Migration Rule：备份 -> DROP -> CREATE(新结构) -> 回填 -> 重建索引 -> 完整性校验。
+    model_mappings 表当前规模 ~14 行，备份-重建开销可忽略。
+
+    回填统一 0（关闭）：「默认不注入」对所有上游都是安全选择（维持原行为），仅 MiniMax
+    等依赖 Interleaved Thinking 的上游需在 UI 显式开启。避免对老映射默认开开关导致
+    历史请求历史携带额外 token（虽然无害，但避免无谓的语义变更）。
+    """
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(model_mappings)").fetchall()]
+    if "think_injection" in cols:
+        return  # 幂等：列已存在则跳过
+
+    # 1. 备份
+    mm_count_before = conn.execute("SELECT COUNT(*) FROM model_mappings").fetchone()[0]
+    old_rows = conn.execute("SELECT * FROM model_mappings").fetchall()
+    old_col_names = [d[0] for d in conn.execute("SELECT * FROM model_mappings LIMIT 0").description]
+    dangling_before = conn.execute(
+        "SELECT COUNT(*) FROM model_mappings WHERE provider_id NOT IN (SELECT id FROM providers)"
+    ).fetchone()[0]
+
+    # 2. DROP
+    conn.execute("DROP TABLE model_mappings")
+
+    # 3. CREATE（带新列）
+    conn.execute("""
+        CREATE TABLE model_mappings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alias TEXT NOT NULL,
+            target_model TEXT NOT NULL,
+            provider_id INTEGER NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 1,
+            model_type TEXT NOT NULL DEFAULT 'text',
+            max_tokens INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            role_mappings TEXT NOT NULL DEFAULT '[]',
+            reasoning_effort_supported INTEGER NOT NULL DEFAULT 1,
+            think_injection INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (provider_id) REFERENCES providers(id)
+        )
+    """)
+
+    # 4. 重建索引
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_model_mappings_alias_enabled "
+        "ON model_mappings(alias, enabled)"
+    )
+
+    # 5. 回填（统一 0，默认关闭/不注入 <think>）
+    for row in old_rows:
+        rd = dict(zip(old_col_names, row))
+        conn.execute(
+            "INSERT INTO model_mappings (id, alias, target_model, provider_id, priority, "
+            "model_type, max_tokens, enabled, role_mappings, reasoning_effort_supported, think_injection) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                rd["id"], rd["alias"], rd["target_model"], rd["provider_id"],
+                int(rd.get("priority") or 1), rd.get("model_type") or "text",
+                int(rd.get("max_tokens") or 0), int(rd.get("enabled", 1)),
+                rd.get("role_mappings") or "[]",
+                int(rd.get("reasoning_effort_supported", 1)),
+                0,  # 默认关闭：迁移后老映射维持原行为（不注入），MiniMax 等需手动开启
+            ),
+        )
+    conn.commit()
+
+    # 6. 完整性校验
+    mm_count_after = conn.execute("SELECT COUNT(*) FROM model_mappings").fetchone()[0]
+    if mm_count_after != mm_count_before:
+        raise RuntimeError(f"model_mappings 迁移后行数不一致：{mm_count_before} -> {mm_count_after}")
+    dangling_after = conn.execute(
+        "SELECT COUNT(*) FROM model_mappings WHERE provider_id NOT IN (SELECT id FROM providers)"
+    ).fetchone()[0]
+    if dangling_after != dangling_before:
+        raise RuntimeError(f"model_mappings 迁移后悬空 provider_id 数量变化：{dangling_before} -> {dangling_after}")
+
+
 def _create_latest_schema(conn):
     """用最新 schema 创建所有表（CREATE TABLE IF NOT EXISTS）。
 
@@ -667,6 +749,7 @@ def _create_latest_schema(conn):
             enabled INTEGER NOT NULL DEFAULT 1,
             role_mappings TEXT NOT NULL DEFAULT '[]',
             reasoning_effort_supported INTEGER NOT NULL DEFAULT 1,
+            think_injection INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (provider_id) REFERENCES providers(id)
         );
 
@@ -871,6 +954,11 @@ _MIGRATIONS = [
         "添加模型映射推理强度透传开关：model_mappings 表新增 reasoning_effort_supported 列",
         _migrate_model_mappings_add_reasoning,
     ),
+    (
+        3,
+        "添加模型映射思考链注入开关：model_mappings 表新增 think_injection 列",
+        _migrate_model_mappings_add_think_injection,
+    ),
 ]
 
 CURRENT_SCHEMA_VERSION = len(_MIGRATIONS)
@@ -973,6 +1061,8 @@ def _calibrate_user_version(conn):
     cols_mm = [r[1] for r in conn.execute("PRAGMA table_info(model_mappings)").fetchall()]
     if "reasoning_effort_supported" in cols_mm:
         detected = 2  # v2 标志列存在；v2 隐含 v1，故无需再判 v1
+    if "think_injection" in cols_mm:
+        detected = 3  # v3 标志列存在；v3 隐含 v2/v1，故无需再判前置版本
     current = conn.execute("PRAGMA user_version").fetchone()[0]
     if detected > current:
         conn.execute(f"PRAGMA user_version = {detected}")
@@ -1173,7 +1263,7 @@ def get_model_mapping_by_alias(alias):
     return [dict(r) for r in rows]
 
 
-def add_model_mapping(alias, target_model, provider_id, enabled=True, priority=1, model_type="text", max_tokens=0, role_mappings=None, reasoning_effort_supported=1):
+def add_model_mapping(alias, target_model, provider_id, enabled=True, priority=1, model_type="text", max_tokens=0, role_mappings=None, reasoning_effort_supported=1, think_injection=0):
     conn = get_conn()
     c = conn.cursor()
     if role_mappings is None:
@@ -1181,8 +1271,8 @@ def add_model_mapping(alias, target_model, provider_id, enabled=True, priority=1
     elif isinstance(role_mappings, (list, dict)):
         role_mappings = json.dumps(role_mappings, ensure_ascii=False)
     c.execute(
-        "INSERT INTO model_mappings (alias, target_model, provider_id, priority, model_type, max_tokens, enabled, role_mappings, reasoning_effort_supported) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (alias, target_model, provider_id, int(priority), model_type, int(max_tokens), int(enabled), role_mappings, int(reasoning_effort_supported)),
+        "INSERT INTO model_mappings (alias, target_model, provider_id, priority, model_type, max_tokens, enabled, role_mappings, reasoning_effort_supported, think_injection) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (alias, target_model, provider_id, int(priority), model_type, int(max_tokens), int(enabled), role_mappings, int(reasoning_effort_supported), int(think_injection)),
     )
     conn.commit()
     mapping_id = c.lastrowid
@@ -1191,7 +1281,7 @@ def add_model_mapping(alias, target_model, provider_id, enabled=True, priority=1
 
 
 def update_model_mapping(mapping_id, **kwargs):
-    allowed = {"alias", "target_model", "provider_id", "enabled", "priority", "model_type", "max_tokens", "role_mappings", "reasoning_effort_supported"}
+    allowed = {"alias", "target_model", "provider_id", "enabled", "priority", "model_type", "max_tokens", "role_mappings", "reasoning_effort_supported", "think_injection"}
     fields = []
     values = []
     for k, v in kwargs.items():
@@ -1203,7 +1293,7 @@ def update_model_mapping(mapping_id, **kwargs):
                     v = json.dumps(v, ensure_ascii=False)
                 values.append(v)
             else:
-                values.append(int(v) if k in ("enabled", "priority", "max_tokens", "reasoning_effort_supported") else v)
+                values.append(int(v) if k in ("enabled", "priority", "max_tokens", "reasoning_effort_supported", "think_injection") else v)
     if not fields:
         return
     values.append(mapping_id)
