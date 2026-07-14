@@ -207,6 +207,69 @@ def _apply_role_replacement(body, rules):
                 msg["role"] = new_role
 
 
+def _apply_role_replacement_responses(body, rules):
+    """按 rules 替换 Responses 请求体 input[] 中各 message 项的 role 字段。
+
+    仿 _apply_role_replacement，但操作 input 数组（Responses API 用 input[] 而非 messages[]）。
+    仅对含 role 字段的项生效，跳过 type=function_call / function_call_output 等无 role 项。
+    用于 native_responses 原生透传路径，使 developer→system 等角色替换对原生 Responses 请求体生效。
+    """
+    if not rules:
+        return
+    # 一次性映射：相同原角色只取第一条规则，避免链式替换（A→B, B→C 把 A 变成 C）
+    mapping_table = {}
+    for r in rules:
+        f, t = r.get("from"), r.get("to")
+        if f and t and f != t and f not in mapping_table:
+            mapping_table[f] = t
+    if not mapping_table:
+        return
+    input_val = body.get("input")
+    if not isinstance(input_val, list):
+        return
+    for item in input_val:
+        if isinstance(item, dict):
+            new_role = mapping_table.get(item.get("role"))
+            if new_role:
+                item["role"] = new_role
+
+
+def _apply_max_output_tokens_clamp(body, model_max_tokens):
+    """按 model_max_tokens 钳制 Responses 请求体 max_output_tokens 字段。
+
+    Responses API 用 max_output_tokens（非 Chat 的 max_tokens）。仅在 model_max_tokens > 0 时生效：
+      - 客户端未传或 <=0：填入 model_max_tokens
+      - 客户端传入超过 model_max_tokens：裁剪到 model_max_tokens
+    用于 native_responses 原生透传路径，避免上游因超限返回 400。
+    """
+    if model_max_tokens <= 0:
+        return
+    cur = body.get("max_output_tokens")
+    if not cur or cur <= 0:
+        body["max_output_tokens"] = model_max_tokens
+    elif cur > model_max_tokens:
+        body["max_output_tokens"] = model_max_tokens
+
+
+def _openai_responses_url(provider):
+    """从 provider.openai_url 派生原生 Responses 端点 URL。
+
+    规则：
+      - 已以 /responses 结尾 → 原样使用（full_path=1 显式配置了 Responses 端点）
+      - 以 /chat/completions 结尾 → 替换后缀为 /responses
+      - full_path=0（base URL）且未以 /responses 结尾 → 追加 /responses
+      - full_path=1 且 URL 不以上述后缀结尾 → 原样使用（用户显式配置，信任其完整性）
+    """
+    url = provider["openai_url"].rstrip("/")
+    if url.endswith("/responses"):
+        return url
+    if url.endswith("/chat/completions"):
+        return url[:-len("/chat/completions")] + "/responses"
+    if not provider.get("full_path", 1):
+        return url + "/responses"
+    return url
+
+
 def _apply_reasoning_effort(body, target_model, reasoning_effort_supported=False):
     """按模型映射的 reasoning_effort_supported 开关决定是否透传 reasoning_effort 字段。
 
@@ -678,6 +741,7 @@ def _resolve_openai_provider(request_body, client_ip=""):
                 "reasoning_effort_supported": 1,  # 无映射场景默认透传，与新建映射默认值一致
                 "think_injection": 0,  # 无映射场景默认不注入 <think>，与新建映射默认值一致
                 "reasoning_content_field": 0,  # 无映射场景默认不注入 reasoning_content 字段
+                "native_responses": 0,  # 无映射场景默认不启用原生 Responses 透传
             }], None
         return None, f"未找到模型 '{model}' 的映射，也没有可用的 OpenAI 提供商"
     else:
@@ -712,6 +776,7 @@ def _resolve_openai_provider(request_body, client_ip=""):
                 "reasoning_effort_supported": m.get("reasoning_effort_supported", 0),
                 "think_injection": m.get("think_injection", 0),
                 "reasoning_content_field": m.get("reasoning_content_field", 0),
+                "native_responses": m.get("native_responses", 0),
             })
         return candidates, None
 
@@ -975,6 +1040,159 @@ def _stream_response_openai(url, headers, body, provider, target_model, sem=None
             if input_tokens > 0 or output_tokens > 0 or cache_read_input_tokens > 0 or cache_creation_input_tokens > 0:
                 _track_usage(provider["id"], input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens)
             # 流式半失败：上游已开始 yield 但中途断开/出错，直接 mark_degraded 该 mapping。
+            if status == "error" and mapping_id:
+                mark_degraded(mapping_id, degradation_duration)
+
+    return generate(), resp.status_code, {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+
+def _proxy_openai_responses_native(request_body, provider, target_model, stream, sem=None, client_ip="", start_time=None, model_type="text", source_model="", model_max_tokens=0, role_rules=None, mapping_id=None, degradation_duration=0, reasoning_effort_supported=False):
+    """原生 Responses 透传：直接转发 Responses 格式请求到 provider 派生的 /responses 端点。
+
+    用于 native_responses=1 的 mapping：完全跳过 Responses↔Chat 双向转换，body 原样转发，
+    响应原样返回（仿 Anthropic handler 直转语义）。
+
+    与 _proxy_openai_direct 的差异：
+      - URL 用 _openai_responses_url 派生 /responses 端点（而非 /chat/completions）
+      - 保留 input[] 结构，不调用 _convert_responses_to_chat / _responses_input_to_chat_messages
+      - 角色替换走 _apply_role_replacement_responses（操作 input[] 而非 messages[]）
+      - max_tokens 钳制走 _apply_max_output_tokens_clamp（操作 max_output_tokens 而非 max_tokens）
+      - 不做 _strip_images_openai（Responses 原生支持图片）
+      - _apply_reasoning_effort 在原生路径为空操作（request_body 无 _codex_reasoning_effort 私有键；
+        codex 发出的 reasoning 字段由上游原生识别处理）
+
+    信号量释放约定与 _proxy_openai_direct 一致：非流式由调用方（handle_openai_responses_request）
+    统一释放，本函数不再在 finally 中释放；流式由 _stream_response_openai_responses_native 的
+    generate() finally 或 status>=400 分支释放。
+    """
+    url = _openai_responses_url(provider)
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {provider['api_key']}",
+    }
+    body = dict(request_body)
+    body["model"] = target_model
+
+    # Responses 专属适配：角色替换（input[]）+ max_output_tokens 钳制
+    _apply_role_replacement_responses(body, role_rules)
+    _apply_max_output_tokens_clamp(body, model_max_tokens)
+
+    # 透传 reasoning_effort（原生路径 request_body 无 _codex_reasoning_effort 私有键，此处为空操作；
+    # 若 body 带有该键也会被正确处理并 pop 掉，保持请求体干净）
+    _apply_reasoning_effort(body, target_model, reasoning_effort_supported)
+
+    if stream:
+        return _stream_response_openai_responses_native(
+            url, headers, body, provider, target_model, sem, client_ip, start_time,
+            source_model, mapping_id, degradation_duration,
+        )
+
+    # 非流式：信号量由调用方统一释放，本函数不在 finally 释放，避免双重释放
+    resp = _post_with_retry(url, headers=headers, json=body, timeout=120)
+    resp_content = resp.content
+    original_code = resp.status_code
+    mapped_code = config.get_mapped_code(original_code, provider["name"])
+    # 原生 Responses 响应 usage 结构：{input_tokens, output_tokens, ...}
+    try:
+        resp_json = resp.json()
+    except Exception:
+        resp_json = {}
+    usage = resp_json.get("usage", {}) if isinstance(resp_json, dict) else {}
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    config.add_log(
+        provider=provider["name"], model=target_model, source_model=source_model,
+        input_tokens=input_tokens, output_tokens=output_tokens,
+        status="success" if original_code == 200 else "error",
+        duration_ms=int((time.time() - start_time) * 1000),
+        error_msg="" if original_code == 200 else resp_content.decode("utf-8", errors="replace")[:500],
+        request_body=json.dumps(body, ensure_ascii=False),
+        response_body=resp_content.decode("utf-8", errors="replace")[:2000],
+        original_status_code=original_code, mapped_status_code=mapped_code,
+        client_ip=client_ip,
+    )
+    if original_code == 200:
+        _track_usage(provider.get("id", 0), input_tokens, output_tokens)
+    # 原样返回上游响应（已是 Responses 格式，调用方直接透传给 codex）
+    return resp_content, mapped_code, {"Content-Type": "application/json"}
+
+
+def _stream_response_openai_responses_native(url, headers, body, provider, target_model, sem=None, client_ip="", start_time=None, source_model="", mapping_id=None, degradation_duration=0):
+    """原生 Responses 流式透传：原样转发上游 Responses SSE 事件序列，不做任何转换。
+
+    仿 Anthropic _stream_response：纯透传，无心跳、无事件重整、无 JSON 转换。
+    usage 从 response.completed 事件的 usage 字段提取（OpenAI Responses 流式 usage 字段名：
+    input_tokens / output_tokens）。错误响应（status>=400）原样透传给 codex 解析。
+    """
+    resp = _post_with_retry(url, headers=headers, json=body, stream=True, timeout=300)
+    original_status_code = resp.status_code
+
+    # 上游返回非 2xx，不作为流式转发，原样返回上游 Responses 错误格式
+    if original_status_code >= 400:
+        error_body = resp.text
+        resp.close()
+        mapped_code = config.get_mapped_code(original_status_code, provider["name"])
+        _release_concurrency(provider["id"], sem)
+        config.add_log(
+            provider=provider["name"], model=target_model, source_model=source_model,
+            input_tokens=0, output_tokens=0,
+            status="error", duration_ms=int((time.time() - start_time) * 1000),
+            error_msg=error_body[:500],
+            request_body=json.dumps(body, ensure_ascii=False),
+            response_body=error_body,
+            original_status_code=original_status_code, mapped_status_code=mapped_code,
+            client_ip=client_ip,
+        )
+        return error_body.encode("utf-8"), mapped_code, {"Content-Type": "application/json"}
+
+    def generate():
+        input_tokens = 0
+        output_tokens = 0
+        response_chunks = []
+        error_msg = ""
+        try:
+            for line in resp.iter_lines():
+                if not line:
+                    # 空行是 SSE 事件分隔符，必须保留以保证客户端正确解析事件边界
+                    yield "\n"
+                    continue
+                decoded = line.decode("utf-8", errors="replace")
+                response_chunks.append(decoded)
+                yield decoded + "\n"
+                # 从 Responses SSE 的 response.completed 事件提取 usage
+                if decoded.startswith("data:"):
+                    try:
+                        d = json.loads(_parse_sse_data(decoded))
+                        event_type = d.get("type", "")
+                        if event_type == "response.completed":
+                            usage = d.get("response", {}).get("usage", {}) or d.get("usage", {})
+                            if usage:
+                                input_tokens = usage.get("input_tokens", 0)
+                                output_tokens = usage.get("output_tokens", 0)
+                    except (json.JSONDecodeError, IndexError):
+                        pass
+        except _CONN_ABORT_ERRORS:
+            # 连接级异常（上游断开/超时/客户端断开），属于正常中断，不记录 error_msg
+            pass
+        except Exception as e:
+            error_msg = str(e)
+        finally:
+            resp.close()
+            _release_concurrency(provider["id"], sem)
+            status = "error" if error_msg else "success"
+            config.add_log(
+                provider=provider["name"], model=target_model, source_model=source_model,
+                input_tokens=input_tokens, output_tokens=output_tokens,
+                status=status, duration_ms=int((time.time() - start_time) * 1000),
+                error_msg=error_msg[:500],
+                request_body=json.dumps(body, ensure_ascii=False),
+                response_body="\n".join(response_chunks[-50:]),
+                original_status_code=original_status_code, mapped_status_code=original_status_code,
+                client_ip=client_ip,
+            )
+            if input_tokens > 0 or output_tokens > 0:
+                _track_usage(provider["id"], input_tokens, output_tokens)
+            # 流式半失败：上游已开始 yield 但中途断开/出错，直接 mark_degraded 该 mapping
             if status == "error" and mapping_id:
                 mark_degraded(mapping_id, degradation_duration)
 
@@ -2476,6 +2694,7 @@ def handle_openai_responses_request(request_body, client_ip=""):
         reasoning_effort_supported = chosen.get("reasoning_effort_supported", 0)
         think_injection = chosen.get("think_injection", 0)
         reasoning_content_field = chosen.get("reasoning_content_field", 0)
+        native_responses = chosen.get("native_responses", 0)
         provider_id = provider.get("id", 0)
         max_concurrency = provider.get("max_concurrency", 0)
 
@@ -2502,7 +2721,47 @@ def handle_openai_responses_request(request_body, client_ip=""):
         sem_released = False
 
         try:
-            if stream:
+            if native_responses:
+                # 原生透传路径：跳过 Responses↔Chat 双向转换，原样转发到上游派生的 /responses 端点
+                # （仿 Anthropic handler 直转语义，仅做 model 替换 + Responses 专属适配）
+                url = _openai_responses_url(provider)
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {provider['api_key']}",
+                }
+                if stream:
+                    body = dict(request_body)
+                    body["model"] = target_model
+                    # Responses 专属适配：input[] 角色替换 + max_output_tokens 钳制
+                    _apply_role_replacement_responses(body, role_rules)
+                    _apply_max_output_tokens_clamp(body, model_max_tokens)
+                    _apply_reasoning_effort(body, target_model, reasoning_effort_supported)
+                    # 不做 _strip_images_openai（Responses 原生支持图片）、不重转 messages
+                    body["stream"] = True
+                    response = _stream_response_openai_responses_native(
+                        url, headers, body, provider, target_model,
+                        sem=sem, client_ip=client_ip, start_time=start_time,
+                        source_model=model, mapping_id=mid,
+                        degradation_duration=cfg.get("duration", 30),
+                    )
+                    # 调用返回即代表信号量已被 generate() finally 或 status>=400 分支接管
+                    sem_released = True
+                else:
+                    content, status_code, _ = _proxy_openai_responses_native(
+                        request_body, provider, target_model, False,
+                        sem=sem, client_ip=client_ip, start_time=start_time,
+                        model_type=model_type, source_model=model,
+                        model_max_tokens=model_max_tokens,
+                        role_rules=role_rules,
+                        mapping_id=mid, degradation_duration=cfg.get("duration", 30),
+                        reasoning_effort_supported=reasoning_effort_supported,
+                    )
+                    # 非流式调用返回即代表不再持有信号量
+                    sem_released = True
+                    _release_concurrency(provider_id, sem)
+                    # 原生上游响应已是 Responses 格式（含错误响应），原样透传给 codex
+                    response = (content, status_code, {"Content-Type": "application/json"})
+            elif stream:
                 # 流式：按当前候选构造请求体（每个候选可能有不同的角色映射/模型限制）
                 body = dict(chat_body)
                 # 任一注入开关开启时，chat_body（按默认都 False 转换、reasoning 丢弃）需要用

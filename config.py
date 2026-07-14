@@ -805,6 +805,96 @@ def _migrate_model_mappings_add_reasoning_content_field(conn):
         raise RuntimeError(f"model_mappings 迁移后悬空 provider_id 数量变化：{dangling_before} -> {dangling_after}")
 
 
+def _migrate_model_mappings_add_native_responses(conn):
+    """v4->v5：model_mappings 表新增 native_responses 列，默认 0（关闭/走 Responses→Chat 转换）。
+
+    0 = 关闭：/openai 端点对该 mapping 走原 Responses→Chat 双向转换路径（原行为）。
+    1 = 开启：/openai 端点对该 mapping 跳过转换，按 provider.openai_url 派生 /responses
+        端点直接转发原 Responses body（仿 Anthropic handler 直转语义）。
+
+    与 think_injection / reasoning_content_field 三方互斥（前端 UI 保证同一时间最多开一个）：
+    开启 native_responses 后，Responses↔Chat 转换被完全跳过，think_injection 与
+    reasoning_content_field 都失去作用对象，故三者互斥。三个都关 = 走转换并丢弃 reasoning。
+
+    严格遵循 SQLite Migration Rule：备份 -> DROP -> CREATE(新结构) -> 回填 -> 重建索引 -> 完整性校验。
+
+    回填统一 0（保守，默认关闭）：native_responses 透传要求 provider 实际暴露 /responses 端点，
+    多数 OpenAI 兼容上游仅暴露 /chat/completions；自动开启会误把这类上游打到 /responses 404，
+    故默认关闭，由用户对确知支持 Responses 的上游显式开启。
+    """
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(model_mappings)").fetchall()]
+    if "native_responses" in cols:
+        return  # 幂等：列已存在则跳过
+
+    # 1. 备份
+    mm_count_before = conn.execute("SELECT COUNT(*) FROM model_mappings").fetchone()[0]
+    old_rows = conn.execute("SELECT * FROM model_mappings").fetchall()
+    old_col_names = [d[0] for d in conn.execute("SELECT * FROM model_mappings LIMIT 0").description]
+    dangling_before = conn.execute(
+        "SELECT COUNT(*) FROM model_mappings WHERE provider_id NOT IN (SELECT id FROM providers)"
+    ).fetchone()[0]
+
+    # 2. DROP
+    conn.execute("DROP TABLE model_mappings")
+
+    # 3. CREATE（带新列）
+    conn.execute("""
+        CREATE TABLE model_mappings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alias TEXT NOT NULL,
+            target_model TEXT NOT NULL,
+            provider_id INTEGER NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 1,
+            model_type TEXT NOT NULL DEFAULT 'text',
+            max_tokens INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            role_mappings TEXT NOT NULL DEFAULT '[]',
+            reasoning_effort_supported INTEGER NOT NULL DEFAULT 1,
+            think_injection INTEGER NOT NULL DEFAULT 0,
+            reasoning_content_field INTEGER NOT NULL DEFAULT 1,
+            native_responses INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (provider_id) REFERENCES providers(id)
+        )
+    """)
+
+    # 4. 重建索引
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_model_mappings_alias_enabled "
+        "ON model_mappings(alias, enabled)"
+    )
+
+    # 5. 回填（统一 0，默认关闭/走 Responses→Chat 转换）
+    for row in old_rows:
+        rd = dict(zip(old_col_names, row))
+        conn.execute(
+            "INSERT INTO model_mappings (id, alias, target_model, provider_id, priority, "
+            "model_type, max_tokens, enabled, role_mappings, reasoning_effort_supported, "
+            "think_injection, reasoning_content_field, native_responses) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                rd["id"], rd["alias"], rd["target_model"], rd["provider_id"],
+                int(rd.get("priority") or 1), rd.get("model_type") or "text",
+                int(rd.get("max_tokens") or 0), int(rd.get("enabled", 1)),
+                rd.get("role_mappings") or "[]",
+                int(rd.get("reasoning_effort_supported", 1)),
+                int(rd.get("think_injection", 0)),
+                int(rd.get("reasoning_content_field", 1)),
+                0,  # 默认关闭：多数上游仅暴露 /chat/completions，需用户显式开启
+            ),
+        )
+    conn.commit()
+
+    # 6. 完整性校验
+    mm_count_after = conn.execute("SELECT COUNT(*) FROM model_mappings").fetchone()[0]
+    if mm_count_after != mm_count_before:
+        raise RuntimeError(f"model_mappings 迁移后行数不一致：{mm_count_before} -> {mm_count_after}")
+    dangling_after = conn.execute(
+        "SELECT COUNT(*) FROM model_mappings WHERE provider_id NOT IN (SELECT id FROM providers)"
+    ).fetchone()[0]
+    if dangling_after != dangling_before:
+        raise RuntimeError(f"model_mappings 迁移后悬空 provider_id 数量变化：{dangling_before} -> {dangling_after}")
+
+
 def _create_latest_schema(conn):
     """用最新 schema 创建所有表（CREATE TABLE IF NOT EXISTS）。
 
@@ -840,6 +930,7 @@ def _create_latest_schema(conn):
             reasoning_effort_supported INTEGER NOT NULL DEFAULT 1,
             think_injection INTEGER NOT NULL DEFAULT 0,
             reasoning_content_field INTEGER NOT NULL DEFAULT 1,
+            native_responses INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (provider_id) REFERENCES providers(id)
         );
 
@@ -1054,6 +1145,11 @@ _MIGRATIONS = [
         "添加模型映射 reasoning_content 字段注入开关：model_mappings 表新增 reasoning_content_field 列",
         _migrate_model_mappings_add_reasoning_content_field,
     ),
+    (
+        5,
+        "添加模型映射原生 Responses 透传开关：model_mappings 表新增 native_responses 列",
+        _migrate_model_mappings_add_native_responses,
+    ),
 ]
 
 CURRENT_SCHEMA_VERSION = len(_MIGRATIONS)
@@ -1160,6 +1256,8 @@ def _calibrate_user_version(conn):
         detected = 3  # v3 标志列存在；v3 隐含 v2/v1，故无需再判前置版本
     if "reasoning_content_field" in cols_mm:
         detected = 4  # v4 标志列存在；v4 隐含 v3/v2/v1
+    if "native_responses" in cols_mm:
+        detected = 5  # v5 标志列存在；v5 隐含 v4/v3/v2/v1
     current = conn.execute("PRAGMA user_version").fetchone()[0]
     if detected > current:
         conn.execute(f"PRAGMA user_version = {detected}")
@@ -1360,7 +1458,7 @@ def get_model_mapping_by_alias(alias):
     return [dict(r) for r in rows]
 
 
-def add_model_mapping(alias, target_model, provider_id, enabled=True, priority=1, model_type="text", max_tokens=0, role_mappings=None, reasoning_effort_supported=1, think_injection=0, reasoning_content_field=1):
+def add_model_mapping(alias, target_model, provider_id, enabled=True, priority=1, model_type="text", max_tokens=0, role_mappings=None, reasoning_effort_supported=1, think_injection=0, reasoning_content_field=1, native_responses=0):
     conn = get_conn()
     c = conn.cursor()
     if role_mappings is None:
@@ -1368,8 +1466,8 @@ def add_model_mapping(alias, target_model, provider_id, enabled=True, priority=1
     elif isinstance(role_mappings, (list, dict)):
         role_mappings = json.dumps(role_mappings, ensure_ascii=False)
     c.execute(
-        "INSERT INTO model_mappings (alias, target_model, provider_id, priority, model_type, max_tokens, enabled, role_mappings, reasoning_effort_supported, think_injection, reasoning_content_field) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (alias, target_model, provider_id, int(priority), model_type, int(max_tokens), int(enabled), role_mappings, int(reasoning_effort_supported), int(think_injection), int(reasoning_content_field)),
+        "INSERT INTO model_mappings (alias, target_model, provider_id, priority, model_type, max_tokens, enabled, role_mappings, reasoning_effort_supported, think_injection, reasoning_content_field, native_responses) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (alias, target_model, provider_id, int(priority), model_type, int(max_tokens), int(enabled), role_mappings, int(reasoning_effort_supported), int(think_injection), int(reasoning_content_field), int(native_responses)),
     )
     conn.commit()
     mapping_id = c.lastrowid
@@ -1378,7 +1476,7 @@ def add_model_mapping(alias, target_model, provider_id, enabled=True, priority=1
 
 
 def update_model_mapping(mapping_id, **kwargs):
-    allowed = {"alias", "target_model", "provider_id", "enabled", "priority", "model_type", "max_tokens", "role_mappings", "reasoning_effort_supported", "think_injection", "reasoning_content_field"}
+    allowed = {"alias", "target_model", "provider_id", "enabled", "priority", "model_type", "max_tokens", "role_mappings", "reasoning_effort_supported", "think_injection", "reasoning_content_field", "native_responses"}
     fields = []
     values = []
     for k, v in kwargs.items():
@@ -1390,7 +1488,7 @@ def update_model_mapping(mapping_id, **kwargs):
                     v = json.dumps(v, ensure_ascii=False)
                 values.append(v)
             else:
-                values.append(int(v) if k in ("enabled", "priority", "max_tokens", "reasoning_effort_supported", "think_injection", "reasoning_content_field") else v)
+                values.append(int(v) if k in ("enabled", "priority", "max_tokens", "reasoning_effort_supported", "think_injection", "reasoning_content_field", "native_responses") else v)
     if not fields:
         return
     values.append(mapping_id)

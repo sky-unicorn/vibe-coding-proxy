@@ -384,7 +384,7 @@ tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
 
     <!-- 思考链注入 -->
     <div class="form-group" style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-      <label class="toggle"><input type="checkbox" id="cf-think" onchange="if(this.checked)document.getElementById('cf-reasoning-field').checked=false"><span class="toggle-slider"></span></label>
+      <label class="toggle"><input type="checkbox" id="cf-think" onchange="if(this.checked){document.getElementById('cf-reasoning-field').checked=false;document.getElementById('cf-native-responses').checked=false;}"><span class="toggle-slider"></span></label>
       <span style="font-size:13px">思考链注入（<code>&lt;think&gt;...&lt;/think&gt;</code>）</span>
     </div>
     <div style="font-size:11px;color:var(--text2);margin-top:-4px;margin-bottom:8px">
@@ -393,11 +393,22 @@ tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
 
     <!-- reasoning_content 字段注入 -->
     <div class="form-group" style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-      <label class="toggle"><input type="checkbox" id="cf-reasoning-field" checked onchange="if(this.checked)document.getElementById('cf-think').checked=false"><span class="toggle-slider"></span></label>
+      <label class="toggle"><input type="checkbox" id="cf-reasoning-field" checked onchange="if(this.checked){document.getElementById('cf-think').checked=false;document.getElementById('cf-native-responses').checked=false;}"><span class="toggle-slider"></span></label>
       <span style="font-size:13px">思考过程以 <code>reasoning_content</code> 字段注入</span>
     </div>
     <div style="font-size:11px;color:var(--text2);margin-top:-4px;margin-bottom:8px">
       开启后，codex 回传的历史 reasoning 以独立 <code>reasoning_content</code> 字段注入对应 assistant 消息（DeepSeek/GLM/Kimi 思考模式原生字段，多轮工具调用必需，缺失会 400）。MiniMax 等忽略未知字段、无害。默认开启，与上方"思考链注入"互斥（同一时间只能开一个；两个都关则丢弃思考过程）。
+    </div>
+
+    <!-- 原生 Responses 透传 -->
+    <div class="form-group" style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+      <label class="toggle"><input type="checkbox" id="cf-native-responses"
+        onchange="if(this.checked){document.getElementById('cf-think').checked=false;document.getElementById('cf-reasoning-field').checked=false;}">
+        <span class="toggle-slider"></span></label>
+      <span style="font-size:13px">模型原生支持 Responses 协议（透传，跳过 Responses↔Chat 转换）</span>
+    </div>
+    <div style="font-size:11px;color:var(--text2);margin-top:-4px;margin-bottom:16px">
+      开启后，<code>/openai</code> 端点对该 mapping 不做 Responses↔Chat 双向转换，直接按 <code>provider.openai_url</code> 派生 <code>/responses</code> 端点原样转发（仿 Anthropic handler 直转语义）。<b>适用上游</b>：原生支持 Responses API 的 OpenAI 兼容端点；其余上游（仅暴露 <code>/chat/completions</code>）开启后会被 fallback 兜底。开启时，上方两个开关自动关闭、互斥。默认关闭。
     </div>
 
     <div class="form-actions">
@@ -814,6 +825,8 @@ function openCodexConfigModal(m){
   document.getElementById('cf-reasoning').checked=m?!!m.reasoning_effort_supported:true;
   document.getElementById('cf-think').checked=m?!!m.think_injection:false;
   document.getElementById('cf-reasoning-field').checked=m?!!m.reasoning_content_field:true;
+  document.getElementById('cf-native-responses').checked=m?!!m.native_responses:false;
+  // 三方互斥由各开关的 onchange 强制保证（开任一自动取消另两个），无需额外 disabled 逻辑
   document.getElementById('codex-config-modal').classList.add('active');
 }
 function closeCodexConfigModal(){document.getElementById('codex-config-modal').classList.remove('active')}
@@ -824,6 +837,7 @@ async function saveCodexConfig(){
     reasoning_effort_supported:document.getElementById('cf-reasoning').checked,
     think_injection:document.getElementById('cf-think').checked,
     reasoning_content_field:document.getElementById('cf-reasoning-field').checked,
+    native_responses:document.getElementById('cf-native-responses').checked,
   };
   await fetch(API+'/api/models/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
   closeCodexConfigModal();loadModels();
