@@ -195,24 +195,28 @@ def _apply_role_replacement(body, rules):
                 msg["role"] = new_role
 
 
-def _apply_reasoning_effort(body, target_model):
-    """按 target_model 启发式映射 reasoning_effort 到上游参数。
+def _apply_reasoning_effort(body, target_model, reasoning_effort_supported=False):
+    """按模型映射的 reasoning_effort_supported 开关决定是否透传 reasoning_effort 字段。
 
     从 body.pop('_codex_reasoning_effort') 取出 _convert_responses_to_chat 暂存的 effort
-    （如 "high"/"medium"/"low"）。无值或非字符串则直接返回（保持请求体干净）。
+    （如 'high'/'medium'/'low'，OpenAI Responses 三档）。无值或非字符串则直接返回
+    （保持请求体干净，私有键仍被 pop 掉）。
 
-    映射规则：
-      - DeepSeek/GLM/Kimi 等上游统一写 reasoning_effort=<effort>（cc-switch 的 supports_reasoning_effort 默认路径）。
-      - MiniMax 系列保守跳过：MiniMax 用 enable_thinking 且默认已开启，传无效字段可能触发 400。
-      - 未来可按 provider 配置细化扩展。
+    行为：
+      - reasoning_effort_supported=False（默认）-> pop 私有键、return（保守跳过，不发任何字段）
+      - reasoning_effort_supported=True            -> body['reasoning_effort'] = effort（原值透传，不翻译）
+
+    值不翻译：认该字段的国产上游（GLM/DeepSeek/MiniMax）都用 low/medium/high 同语义，
+    原样透传即对，开关只回答「该上游认不认 reasoning_effort 字段名」。
 
     必须在 failover 循环内、target_model 已知后调用（与 _apply_role_replacement 同一位置）。
+    仅 Responses->Chat 路径的请求体携带 _codex_reasoning_effort 私有键；Chat Completions
+    直通请求体无此键，调用为空操作，不污染直通路径。
     """
     effort = body.pop("_codex_reasoning_effort", None)
     if not isinstance(effort, str) or not effort:
         return
-    model_lower = (target_model or "").lower()
-    if "minimax" in model_lower:
+    if not reasoning_effort_supported:
         return
     body["reasoning_effort"] = effort
 
@@ -659,6 +663,7 @@ def _resolve_openai_provider(request_body, client_ip=""):
                 "role_rules": [],
                 "mapping_id": None,
                 "priority": 1,
+                "reasoning_effort_supported": 1,  # 无映射场景默认透传，与新建映射默认值一致
             }], None
         return None, f"未找到模型 '{model}' 的映射，也没有可用的 OpenAI 提供商"
     else:
@@ -690,6 +695,7 @@ def _resolve_openai_provider(request_body, client_ip=""):
                 "mapping_id": m.get("id"),
                 "alias": m.get("alias"),
                 "priority": m.get("priority", 1),
+                "reasoning_effort_supported": m.get("reasoning_effort_supported", 0),
             })
         return candidates, None
 
@@ -729,6 +735,7 @@ def handle_openai_proxy_request(request_body, client_ip=""):
         model_type = chosen["model_type"]
         model_max_tokens = chosen["model_max_tokens"]
         role_rules = chosen["role_rules"]
+        reasoning_effort_supported = chosen.get("reasoning_effort_supported", 0)
         provider_id = provider.get("id", 0)
         max_concurrency = provider.get("max_concurrency", 0)
 
@@ -753,7 +760,7 @@ def handle_openai_proxy_request(request_body, client_ip=""):
         # - 流式：_stream_response_openai 在 status>=400 时内部释放，或由 generate() finally 释放；
         #   仅当 _post_with_retry 抛出异常时由本处 except 释放
         try:
-            response = _proxy_openai_direct(request_body, provider, target_model, stream, sem, client_ip, start_time, model_type, model, model_max_tokens, role_rules, mid, cfg.get("duration", 30))
+            response = _proxy_openai_direct(request_body, provider, target_model, stream, sem, client_ip, start_time, model_type, model, model_max_tokens, role_rules, mid, cfg.get("duration", 30), reasoning_effort_supported=reasoning_effort_supported)
         except _CONN_ABORT_ERRORS as e:
             _release_concurrency(provider_id, sem)
             duration_ms = int((time.time() - start_time) * 1000)
@@ -805,7 +812,7 @@ def handle_openai_proxy_request(request_body, client_ip=""):
     return _error_response_openai(f"模型 '{model}' 没有可用的 OpenAI 提供商", 503)
 
 
-def _proxy_openai_direct(request_body, provider, target_model, stream, sem=None, client_ip="", start_time=None, model_type="text", source_model="", model_max_tokens=0, role_rules=None, mapping_id=None, degradation_duration=0):
+def _proxy_openai_direct(request_body, provider, target_model, stream, sem=None, client_ip="", start_time=None, model_type="text", source_model="", model_max_tokens=0, role_rules=None, mapping_id=None, degradation_duration=0, reasoning_effort_supported=False):
     """OpenAI 格式直接转发到 provider 的 openai_url。
 
     full_path=1（默认）：配置的 openai_url 原样使用，不拼接任何后缀。
@@ -829,7 +836,7 @@ def _proxy_openai_direct(request_body, provider, target_model, stream, sem=None,
 
     # 透传 reasoning_effort（仅 Responses→Chat 转换的请求体携带 _codex_reasoning_effort 私有键时生效；
     # 直接 Chat Completions 请求体无此键，调用为空操作，不污染直通路径）
-    _apply_reasoning_effort(body, target_model)
+    _apply_reasoning_effort(body, target_model, reasoning_effort_supported)
 
     # 文本模型需替换图片内容为文本提示，多模态模型保留图片
     if model_type != "multimodal":
@@ -2280,6 +2287,7 @@ def handle_openai_responses_request(request_body, client_ip=""):
         model_type = chosen["model_type"]
         model_max_tokens = chosen["model_max_tokens"]
         role_rules = chosen["role_rules"]
+        reasoning_effort_supported = chosen.get("reasoning_effort_supported", 0)
         provider_id = provider.get("id", 0)
         max_concurrency = provider.get("max_concurrency", 0)
 
@@ -2312,7 +2320,7 @@ def handle_openai_responses_request(request_body, client_ip=""):
                 _apply_role_replacement(body, role_rules)
                 body["model"] = target_model
                 # 透传 reasoning_effort（Codex CLI 的 model_reasoning_effort=high 在 _convert_responses_to_chat 已暂存到私有键）
-                _apply_reasoning_effort(body, target_model)
+                _apply_reasoning_effort(body, target_model, reasoning_effort_supported)
                 if model_type != "multimodal":
                     _strip_images_openai(body)
                 # 模型 max_tokens 上限钳制
@@ -2353,6 +2361,7 @@ def handle_openai_responses_request(request_body, client_ip=""):
                     model_max_tokens=model_max_tokens,
                     role_rules=role_rules,
                     mapping_id=mid, degradation_duration=cfg.get("duration", 30),
+                    reasoning_effort_supported=reasoning_effort_supported,
                 )
                 # 非流式调用返回即代表不再持有信号量
                 sem_released = True

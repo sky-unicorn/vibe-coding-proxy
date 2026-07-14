@@ -359,6 +359,13 @@ tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
       <label class="toggle"><input type="checkbox" id="mf-enabled" checked><span class="toggle-slider"></span></label>
       <span style="font-size:13px">启用</span>
     </div>
+    <div class="form-group" style="display:flex;align-items:center;gap:8px">
+      <label class="toggle"><input type="checkbox" id="mf-reasoning" checked><span class="toggle-slider"></span></label>
+      <span style="font-size:13px">透传思考强度参数（<code>reasoning_effort</code>）</span>
+    </div>
+    <div style="font-size:11px;color:var(--text2);margin-top:-4px;margin-bottom:8px">
+      开启后，调用方传来的思考强度（如 codex 的 <code>reasoning_effort=high</code>）会作为 <code>reasoning_effort</code> 原值透传给该上游；关闭则保守跳过（不发该字段）。<b>兼容性参考</b>：GLM/DeepSeek 原生认此字段；MiniMax 接受但不调深度；火山/讯飞/Kimi 参数名不同，传过去多半被上游忽略（不报错），默认开启，若实测出现 400 再关闭。值 <code>low/medium/high</code> 不做翻译。
+    </div>
     <div class="form-actions">
       <button class="btn" style="background:var(--border);color:var(--text)" onclick="closeModelModal()">取消</button>
       <button class="btn btn-primary" onclick="saveModel()">保存</button>
@@ -745,6 +752,7 @@ async function openModelModal(m){
   document.getElementById('mf-max-tokens').value=m?m.max_tokens:0;
   document.getElementById('mf-provider').value=m?m.provider_id:(providers[0]?.id||'');
   document.getElementById('mf-enabled').checked=m?m.enabled:true;
+  document.getElementById('mf-reasoning').checked=m?!!m.reasoning_effort_supported:true;
   document.getElementById('model-modal').classList.add('active');
 }
 function closeModelModal(){document.getElementById('model-modal').classList.remove('active')}
@@ -759,6 +767,7 @@ async function saveModel(){
     max_tokens:parseInt(document.getElementById('mf-max-tokens').value)||0,
     provider_id:parseInt(document.getElementById('mf-provider').value),
     enabled:document.getElementById('mf-enabled').checked,
+    reasoning_effort_supported:document.getElementById('mf-reasoning').checked,
   };
   if(id) await fetch(API+'/api/models/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
   else await fetch(API+'/api/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
