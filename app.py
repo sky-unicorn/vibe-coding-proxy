@@ -342,6 +342,7 @@ def api_add_model():
         max_tokens=data.get("max_tokens", 0),
         role_mappings=data.get("role_mappings", "[]"),
         think_injection=data.get("think_injection", 0),
+        reasoning_content_field=data.get("reasoning_content_field", 1),
     )
     return jsonify({"id": mid}), 201
 

@@ -677,6 +677,7 @@ def _resolve_openai_provider(request_body, client_ip=""):
                 "priority": 1,
                 "reasoning_effort_supported": 1,  # 无映射场景默认透传，与新建映射默认值一致
                 "think_injection": 0,  # 无映射场景默认不注入 <think>，与新建映射默认值一致
+                "reasoning_content_field": 0,  # 无映射场景默认不注入 reasoning_content 字段
             }], None
         return None, f"未找到模型 '{model}' 的映射，也没有可用的 OpenAI 提供商"
     else:
@@ -710,6 +711,7 @@ def _resolve_openai_provider(request_body, client_ip=""):
                 "priority": m.get("priority", 1),
                 "reasoning_effort_supported": m.get("reasoning_effort_supported", 0),
                 "think_injection": m.get("think_injection", 0),
+                "reasoning_content_field": m.get("reasoning_content_field", 0),
             })
         return candidates, None
 
@@ -1397,7 +1399,7 @@ def _inject_think_into_assistant_content(base_content, reasoning):
     return base_content
 
 
-def _responses_input_to_chat_messages(input_val, instructions=None, think_injection=False):
+def _responses_input_to_chat_messages(input_val, instructions=None, think_injection=False, reasoning_content_field=False):
     """将 Responses API 的 input 字段 + instructions 转为 Chat Completions 的 messages 列表。
 
     input 可以是：
@@ -1406,6 +1408,15 @@ def _responses_input_to_chat_messages(input_val, instructions=None, think_inject
 
     instructions → messages 开头插入 system 消息。
     返回 list[dict]。
+
+    think_injection / reasoning_content_field 互斥（由调用方/UI 保证不同时为 True）：
+      - 都 False（默认）：reasoning item 丢弃（原行为，兼容所有上游）。
+      - think_injection=True：reasoning 以 <think>...</think> 注入 assistant content 前缀
+        （MiniMax-M3 Interleaved Thinking 必需）。
+      - reasoning_content_field=True：reasoning 以独立 reasoning_content 字段注入对应
+        assistant 消息（DeepSeek/GLM/Kimi 思考模式原生字段，多轮工具调用必需，缺失会 400）。
+    转换函数内部按 think_injection 优先判定（理论上不会同时为 True），仅在有 reasoning
+    文本时才加字段/标签，与"都关=丢弃"语义一致。
     """
     messages = []
 
@@ -1436,12 +1447,19 @@ def _responses_input_to_chat_messages(input_val, instructions=None, think_inject
         pending_reasoning_text = ""  # 当前 assistant 消息的累积思考文本
 
         def _flush_assistant_tc(reasoning, tool_calls):
-            """构造 assistant tool_calls 消息；仅当 think_injection 且有 reasoning 时
-            注入 <think> content。think_injection=False（默认）时返回不带 content 键的
-            消息，与原行为完全一致。"""
+            """构造 assistant tool_calls 消息；按注入模式注入 reasoning。
+
+            - 都 False（默认）：返回不带 content 键的消息，与原行为完全一致。
+            - think_injection=True：有 reasoning 时把 <think>...</think> 注入 content。
+            - reasoning_content_field=True：有 reasoning 时把 reasoning_content 注入为独立字段。
+            两者互斥（think_injection 优先），仅在有 reasoning 时才加键，避免无 reasoning 的
+            轮次引入空字段。
+            """
             msg = {"role": "assistant", "tool_calls": tool_calls}
             if think_injection and reasoning:
                 msg["content"] = _inject_think_into_assistant_content(None, reasoning)
+            elif reasoning_content_field and reasoning:
+                msg["reasoning_content"] = reasoning
             return msg
 
         for item in input_val:
@@ -1450,12 +1468,13 @@ def _responses_input_to_chat_messages(input_val, instructions=None, think_inject
 
             item_type = item.get("type", "")
 
-            # reasoning：think_injection=False（默认）时维持原行为 continue 丢弃；
-            # think_injection=True 时提取思考文本累积，在下一条 assistant 消息以 <think> 注入。
+            # reasoning：都 False（默认）时维持原行为 continue 丢弃；
+            # think_injection=True 时提取思考文本累积，在下一条 assistant 消息以 <think> 注入；
+            # reasoning_content_field=True 时同样累积，以独立 reasoning_content 字段注入。
             # codex 把上一轮的 reasoning item 原样回传到此，MiniMax Interleaved Thinking
-            # 依赖其完整回传；其他上游把 <think> 当普通文本无害。默认关闭以维持兼容。
+            # 依赖其完整回传；DeepSeek/GLM/Kimi 依赖 reasoning_content 字段回传（缺失 400）。
             if item_type in ("reasoning", "reasoning_summary"):
-                if think_injection:
+                if think_injection or reasoning_content_field:
                     rt = _extract_reasoning_text(item)
                     if rt:
                         pending_reasoning_text = (
@@ -1506,28 +1525,35 @@ def _responses_input_to_chat_messages(input_val, instructions=None, think_inject
             role = item.get("role", "user")
             content = item.get("content", "")
 
-            # 仅 assistant 消息在 think_injection 开启时注入累积的 reasoning
-            # （user/system/tool 不该带 <think>）。reasoning item 紧跟它所解释的 assistant 动作之前，
-            # 正常流程下在此被消费。
-            if role == "assistant" and think_injection and pending_reasoning_text:
-                content = _inject_think_into_assistant_content(content, pending_reasoning_text)
-                pending_reasoning_text = ""
-
-            # content 可能是 content_part 数组
+            # 仅 assistant 消息注入累积的 reasoning（user/system/tool 不该带思考内容）。
+            # - think_injection：把 <think>...</think> 注入 content 前缀（保留原 content）
+            # - reasoning_content_field：把 reasoning 写入独立 reasoning_content 字段（content 不变）
+            # reasoning item 紧跟它所解释的 assistant 动作之前，正常流程下在此被消费。
             if isinstance(content, list):
                 mapped_content = [_responses_content_part_to_openai(c) for c in content]
-                messages.append({"role": role, "content": mapped_content})
+                new_msg = {"role": role, "content": mapped_content}
             else:
-                messages.append({"role": role, "content": content})
+                new_msg = {"role": role, "content": content}
+
+            if role == "assistant" and pending_reasoning_text:
+                if think_injection:
+                    new_msg["content"] = _inject_think_into_assistant_content(new_msg["content"], pending_reasoning_text)
+                elif reasoning_content_field:
+                    new_msg["reasoning_content"] = pending_reasoning_text
+                pending_reasoning_text = ""
+            messages.append(new_msg)
 
         # 遍历结束后 flush 剩余的 tool_calls（按开关注入 <think>）
         if pending_tool_calls:
             messages.append(_flush_assistant_tc(pending_reasoning_text, pending_tool_calls))
             pending_reasoning_text = ""
-        elif think_injection and pending_reasoning_text:
+        elif (think_injection or reasoning_content_field) and pending_reasoning_text:
             # 防御性兜底：孤立的 reasoning（无对应 tool_calls/message），codex 正常不会这样发，
-            # 追加一条纯 <think> assistant 消息避免思考内容静默丢失（仅 think_injection 开启时）。
-            messages.append({"role": "assistant", "content": f"<think>{pending_reasoning_text}</think>\n"})
+            # 追加一条带思考内容的 assistant 消息避免静默丢失（任一注入模式开启时）。
+            if think_injection:
+                messages.append({"role": "assistant", "content": f"<think>{pending_reasoning_text}</think>\n"})
+            else:  # reasoning_content_field
+                messages.append({"role": "assistant", "content": "", "reasoning_content": pending_reasoning_text})
 
     return messages
 
@@ -2449,6 +2475,7 @@ def handle_openai_responses_request(request_body, client_ip=""):
         role_rules = chosen["role_rules"]
         reasoning_effort_supported = chosen.get("reasoning_effort_supported", 0)
         think_injection = chosen.get("think_injection", 0)
+        reasoning_content_field = chosen.get("reasoning_content_field", 0)
         provider_id = provider.get("id", 0)
         max_concurrency = provider.get("max_concurrency", 0)
 
@@ -2478,14 +2505,16 @@ def handle_openai_responses_request(request_body, client_ip=""):
             if stream:
                 # 流式：按当前候选构造请求体（每个候选可能有不同的角色映射/模型限制）
                 body = dict(chat_body)
-                # think_injection 开启时，chat_body（按默认 think_injection=False 转换，reasoning 丢弃）
-                # 需要用原始 responses_body 重新转换 messages，把 reasoning 注入 <think>。
-                # 仅 think_injection=1 的候选触发，开销可忽略；转换产出新 list，不污染共享的 chat_body。
-                if think_injection:
+                # 任一注入开关开启时，chat_body（按默认都 False 转换、reasoning 丢弃）需要用
+                # 原始 responses_body 重新转换 messages，按开关把 reasoning 注入
+                # （think_injection -> <think> 标签；reasoning_content_field -> 独立字段）。
+                # 仅开启注入的候选触发，开销可忽略；转换产出新 list，不污染共享的 chat_body。
+                if think_injection or reasoning_content_field:
                     body["messages"] = _responses_input_to_chat_messages(
                         request_body.get("input", ""),
                         request_body.get("instructions", ""),
-                        think_injection=True,
+                        think_injection=bool(think_injection),
+                        reasoning_content_field=bool(reasoning_content_field),
                     )
                 _apply_role_replacement(body, role_rules)
                 body["model"] = target_model
@@ -2524,14 +2553,15 @@ def handle_openai_responses_request(request_body, client_ip=""):
                 sem_released = True
             else:
                 # 非流式：_proxy_openai_direct 不再在内部 finally 释放，本处负责释放
-                # think_injection 开启时，按开关重新转换 messages（chat_body 是默认丢弃版本）
+                # 任一注入开关开启时，按开关重新转换 messages（chat_body 是默认丢弃版本）
                 direct_body = chat_body
-                if think_injection:
+                if think_injection or reasoning_content_field:
                     direct_body = dict(chat_body)
                     direct_body["messages"] = _responses_input_to_chat_messages(
                         request_body.get("input", ""),
                         request_body.get("instructions", ""),
-                        think_injection=True,
+                        think_injection=bool(think_injection),
+                        reasoning_content_field=bool(reasoning_content_field),
                     )
                 content, status_code, _ = _proxy_openai_direct(
                     direct_body, provider, target_model, False,
