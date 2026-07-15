@@ -1100,6 +1100,9 @@ def _proxy_openai_responses_native(request_body, provider, target_model, stream,
     usage = resp_json.get("usage", {}) if isinstance(resp_json, dict) else {}
     input_tokens = usage.get("input_tokens", 0)
     output_tokens = usage.get("output_tokens", 0)
+    # Responses 缓存命中 token 位于 input_tokens_details.cached_tokens
+    input_details = usage.get("input_tokens_details") or {}
+    cache_read_input_tokens = input_details.get("cached_tokens", 0)
     config.add_log(
         provider=provider["name"], model=target_model, source_model=source_model,
         input_tokens=input_tokens, output_tokens=output_tokens,
@@ -1110,9 +1113,10 @@ def _proxy_openai_responses_native(request_body, provider, target_model, stream,
         response_body=resp_content.decode("utf-8", errors="replace")[:2000],
         original_status_code=original_code, mapped_status_code=mapped_code,
         client_ip=client_ip,
+        cache_read_input_tokens=cache_read_input_tokens,
     )
     if original_code == 200:
-        _track_usage(provider.get("id", 0), input_tokens, output_tokens)
+        _track_usage(provider.get("id", 0), input_tokens, output_tokens, cache_read_input_tokens)
     # 原样返回上游响应（已是 Responses 格式，调用方直接透传给 codex）
     return resp_content, mapped_code, {"Content-Type": "application/json"}
 
@@ -1148,6 +1152,8 @@ def _stream_response_openai_responses_native(url, headers, body, provider, targe
     def generate():
         input_tokens = 0
         output_tokens = 0
+        cache_read_input_tokens = 0
+        cache_creation_input_tokens = 0
         response_chunks = []
         error_msg = ""
         try:
@@ -1169,6 +1175,9 @@ def _stream_response_openai_responses_native(url, headers, body, provider, targe
                             if usage:
                                 input_tokens = usage.get("input_tokens", 0)
                                 output_tokens = usage.get("output_tokens", 0)
+                                # Responses 缓存命中 token 位于 input_tokens_details.cached_tokens
+                                input_details = usage.get("input_tokens_details") or {}
+                                cache_read_input_tokens = input_details.get("cached_tokens", 0)
                     except (json.JSONDecodeError, IndexError):
                         pass
         except _CONN_ABORT_ERRORS:
@@ -1189,9 +1198,11 @@ def _stream_response_openai_responses_native(url, headers, body, provider, targe
                 response_body="\n".join(response_chunks[-50:]),
                 original_status_code=original_status_code, mapped_status_code=original_status_code,
                 client_ip=client_ip,
+                cache_read_input_tokens=cache_read_input_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
             )
-            if input_tokens > 0 or output_tokens > 0:
-                _track_usage(provider["id"], input_tokens, output_tokens)
+            if input_tokens > 0 or output_tokens > 0 or cache_read_input_tokens > 0 or cache_creation_input_tokens > 0:
+                _track_usage(provider["id"], input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens)
             # 流式半失败：上游已开始 yield 但中途断开/出错，直接 mark_degraded 该 mapping
             if status == "error" and mapping_id:
                 mark_degraded(mapping_id, degradation_duration)
@@ -1946,16 +1957,20 @@ def _convert_chat_to_responses(chat_json, request_model, response_id):
             "arguments": func.get("arguments", ""),
         })
 
-    # usage 字段映射 + output_tokens_details
+    # usage 字段映射 + output_tokens_details + input_tokens_details（缓存命中）
     usage = chat_json.get("usage", {})
     completion_tokens_details = usage.get("completion_tokens_details") or {}
     reasoning_tokens = completion_tokens_details.get("reasoning_tokens", 0)
+    prompt_tokens_details = usage.get("prompt_tokens_details") or {}
+    cached_tokens = prompt_tokens_details.get("cached_tokens", 0)
     resp_usage = {
         "input_tokens": usage.get("prompt_tokens", 0),
         "output_tokens": usage.get("completion_tokens", 0),
         "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
         "total_tokens": usage.get("total_tokens", 0),
     }
+    if cached_tokens > 0:
+        resp_usage["input_tokens_details"] = {"cached_tokens": cached_tokens}
 
     # status 映射：finish_reason=='length' -> 'incomplete' + incomplete_details
     if finish_reason == "length":
@@ -2074,6 +2089,8 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
         response_chunks = []
         input_tokens = 0
         output_tokens = 0
+        cache_read_input_tokens = 0
+        cache_creation_input_tokens = 0
         error_msg = ""
         full_text = ""
         # 文本 message 输出项是否已发送 output_item.added / content_part.added
@@ -2174,6 +2191,9 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
                 if usage_data:
                     input_tokens = usage_data.get("prompt_tokens", 0)
                     output_tokens = usage_data.get("completion_tokens", 0)
+                    # OpenAI 缓存命中 token 位于 prompt_tokens_details.cached_tokens
+                    prompt_details = usage_data.get("prompt_tokens_details") or {}
+                    cache_read_input_tokens = prompt_details.get("cached_tokens", 0)
                     usage_data_ref = usage_data
 
                 choices = chunk.get("choices", [])
@@ -2589,6 +2609,8 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
                     "total_tokens": input_tokens + output_tokens,
                 },
             }
+            if cache_read_input_tokens > 0:
+                completed_response["usage"]["input_tokens_details"] = {"cached_tokens": cache_read_input_tokens}
             if end_turn is not None:
                 completed_response["end_turn"] = end_turn
             if incomplete_details:
@@ -2630,9 +2652,11 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
                 response_body="\n".join(response_chunks[-50:]),
                 original_status_code=original_status_code, mapped_status_code=original_status_code,
                 client_ip=client_ip,
+                cache_read_input_tokens=cache_read_input_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
             )
-            if input_tokens > 0 or output_tokens > 0:
-                _track_usage(provider["id"], input_tokens, output_tokens)
+            if input_tokens > 0 or output_tokens > 0 or cache_read_input_tokens > 0 or cache_creation_input_tokens > 0:
+                _track_usage(provider["id"], input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens)
             # 流式半失败：上游已开始 yield 但中途断开/出错，直接 mark_degraded 该 mapping。
             if status == "error" and mapping_id:
                 mark_degraded(mapping_id, degradation_duration)
