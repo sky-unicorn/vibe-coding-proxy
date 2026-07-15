@@ -2117,6 +2117,12 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
         # ---- usage 详情（reasoning_tokens 等）----
         usage_data_ref = {}  # 保存最近一次 usage chunk，供 completed 时提取详情
 
+        # ---- 流式诊断变量（定位 codex 卡死：记录 generate 在何处、因何因退出）----
+        exit_reason = "normal"            # normal / conn_abort:<ExcType> / exception:<ExcType> / generator_exit
+        completed_sent = False            # response.completed 是否成功 yield
+        upstream_done_received = False    # 上游是否收到 [DONE]
+        upstream_error_type = None        # _upstream_reader 捕获的上游异常类型（None=正常结束）
+
         # ---- 后台读取线程 + Queue：打破 iter_lines 阻塞，使上游静默期能发 SSE 心跳 ----
         # 上游 reasoning 阶段可能数十秒不产出任何数据，原 for line in resp.iter_lines() 会
         # 阻塞主生成器导致 codex 收不到任何事件而 idle timeout 断连。改为后台线程读上游、
@@ -2125,10 +2131,12 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
 
         def _upstream_reader():
             """后台线程：消费上游 SSE 行并投递到 Queue；结束/异常通过哨兵通知主生成器"""
+            nonlocal upstream_error_type
             try:
                 for line in resp.iter_lines():
                     line_queue.put(line)
             except BaseException as e:
+                upstream_error_type = f"{type(e).__name__}: {e}"
                 line_queue.put((_UPSTREAM_ERROR, e))
                 return
             line_queue.put(_UPSTREAM_DONE)
@@ -2180,6 +2188,7 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
                 if not decoded.startswith("data:"):
                     continue
                 if decoded.strip().endswith("[DONE]"):
+                    upstream_done_received = True
                     break
                 try:
                     chunk = json.loads(_parse_sse_data(decoded))
@@ -2620,15 +2629,45 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
                 "type": "response.completed",
                 "response": completed_response,
             })
+            completed_sent = True
 
         except GeneratorExit:
             # 客户端断开连接，WSGI 调 close() 注入 GeneratorExit。
             # 此时不能 yield（会抛 "generator ignored GeneratorExit"），只做资源清理后重新抛出。
+            exit_reason = "generator_exit"
             raise
-        except _CONN_ABORT_ERRORS:
-            # 连接级异常（上游断开/超时/客户端断开），属于正常中断
-            pass
+        except _CONN_ABORT_ERRORS as e:
+            # 连接级异常（上游断开/超时/客户端断开）。
+            # 不再静默 pass：上游断开时发 response.failed 让 codex 走错误重试路径（而非卡死在半截流，
+            # codex 会报 "stream closed before response.completed"）；若异常本身就是客户端已断开
+            # （BrokenPipe 等），yield 会再次抛错被 try 吞掉。无论如何都记 error（不再误记 success）。
+            exit_reason = f"conn_abort:{type(e).__name__}"
+            error_msg = f"流式中断: {type(e).__name__}: {e}"
+            try:
+                yield _sse_event("response.failed", {
+                    "type": "response.failed",
+                    "response": {
+                        "id": response_id,
+                        "object": "response",
+                        "created_at": now,
+                        "model": request_model,
+                        "status": "failed",
+                        "output": [],
+                        "error": {
+                            "message": f"upstream stream error: {type(e).__name__}",
+                            "type": "upstream_stream_error",
+                        },
+                        "usage": {
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "total_tokens": input_tokens + output_tokens,
+                        },
+                    },
+                })
+            except Exception:
+                pass
         except Exception as e:
+            exit_reason = f"exception:{type(e).__name__}"
             error_msg = str(e)
         finally:
             # 仅清理资源，不 yield（避免在 GeneratorExit 上下文中 yield 抛 RuntimeError）
@@ -2643,11 +2682,20 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
                 pass
             _release_concurrency(provider["id"], sem)
             status = "error" if error_msg else "success"
+            # 流式诊断：记录 generate 在何处/因何因退出，定位 codex reasoning 阶段卡死。
+            # 无论 success/error 都写入 error_msg 字段 + print 控制台，便于 web UI / sqlite / 控制台排查。
+            diag = (f"[exit={exit_reason} completed_sent={completed_sent} "
+                    f"upstream_done={upstream_done_received} upstream_err={upstream_error_type} "
+                    f"reasoning_opened={reasoning_opened} text_opened={text_item_opened} "
+                    f"tools={len(tool_call_order)} finish_reason={finish_reason} "
+                    f"in={input_tokens} out={output_tokens}]")
+            print(f"[codex-stream-diag] resp={response_id} {diag}", flush=True)
+            log_error_msg = f"{diag} {error_msg}" if error_msg else diag
             config.add_log(
                 provider=provider["name"], model=target_model, source_model=source_model,
                 input_tokens=input_tokens, output_tokens=output_tokens,
                 status=status, duration_ms=int((time.time() - start_time) * 1000),
-                error_msg=error_msg[:500],
+                error_msg=log_error_msg[:500],
                 request_body=json.dumps(body, ensure_ascii=False),
                 response_body="\n".join(response_chunks[-50:]),
                 original_status_code=original_status_code, mapped_status_code=original_status_code,
@@ -2657,8 +2705,11 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
             )
             if input_tokens > 0 or output_tokens > 0 or cache_read_input_tokens > 0 or cache_creation_input_tokens > 0:
                 _track_usage(provider["id"], input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens)
-            # 流式半失败：上游已开始 yield 但中途断开/出错，直接 mark_degraded 该 mapping。
-            if status == "error" and mapping_id:
+            # 流式半失败：上游已开始 yield 但中途断开/出错，降级该 mapping。
+            # 仅上游侧异常（upstream_error_type 非空）时降级，让 failover 走其他候选；
+            # 客户端(codex)主动断开（upstream_error_type 为空）不算 provider 故障，不降级，
+            # 避免误伤正常 provider。
+            if status == "error" and mapping_id and upstream_error_type is not None:
                 mark_degraded(mapping_id, degradation_duration)
 
     return generate(), resp.status_code, {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
