@@ -75,6 +75,20 @@ tr:hover{background:rgba(99,102,241,.05)}
 .input-toggle-btn{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;color:var(--text2);padding:4px;display:flex;align-items:center;justify-content:center;border-radius:4px;transition:color .15s,background .15s}
 .input-toggle-btn:hover{color:var(--text);background:rgba(255,255,255,.05)}
 .input-toggle-btn svg{width:16px;height:16px;display:block}
+/* 角色映射弹窗 */
+.rm-tip{background:var(--bg);border:1px solid var(--border);border-left:3px solid var(--primary);border-radius:6px;padding:10px 12px;margin-bottom:14px;font-size:12px;line-height:1.6;color:var(--text2)}
+.rm-tip code{background:rgba(99,102,241,.15);color:var(--primary-h);padding:1px 5px;border-radius:3px;font-size:11px}
+.rm-rules-list{display:flex;flex-direction:column;gap:8px}
+.rm-row{display:flex;gap:8px;align-items:center;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;transition:border-color .15s,background .15s}
+.rm-row:hover{border-color:rgba(99,102,241,.4)}
+.rm-row input{flex:1;padding:7px 10px;border-radius:5px;border:1px solid var(--border);background:var(--card);color:var(--text);font-size:13px;outline:none;min-width:0}
+.rm-row input:focus{border-color:var(--primary);background:var(--card)}
+.rm-row input::placeholder{color:var(--text2);opacity:.7}
+.rm-arrow{color:var(--primary-h);font-size:15px;line-height:1;flex-shrink:0;user-select:none}
+.rm-del{flex-shrink:0;width:28px;height:28px;display:flex;align-items:center;justify-content:center;padding:0;border-radius:5px;font-size:13px}
+.rm-empty{text-align:center;padding:18px 12px;color:var(--text2);font-size:12px;background:var(--bg);border:1px dashed var(--border);border-radius:8px}
+.rm-add{margin-top:4px;background:var(--bg);border:1px dashed var(--border);color:var(--text2);width:100%;justify-content:center;font-size:13px}
+.rm-add:hover{border-color:var(--primary);color:var(--primary-h);background:rgba(99,102,241,.05)}
 .pagination{display:flex;gap:8px;align-items:center;justify-content:center;margin-top:16px;font-size:13px;color:var(--text2)}
 .pagination button{background:var(--card);border:1px solid var(--border);color:var(--text);padding:4px 12px;border-radius:4px;cursor:pointer}
 .pagination button:disabled{opacity:.4;cursor:default}
@@ -204,7 +218,7 @@ tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
         <span id="degradation-info" class="save-info"></span>
       </div>
       <table>
-        <thead><tr><th>别名</th><th>优先级</th><th>目标模型</th><th>模型类型</th><th>最大输出 Token 数</th><th>提供商</th><th>角色映射</th><th>状态</th><th>降级状态</th><th>操作</th></tr></thead>
+        <thead><tr><th>别名</th><th>优先级</th><th>目标模型</th><th>模型类型</th><th>最大输出 Token 数</th><th>提供商</th><th>角色映射</th><th>降级状态</th><th>状态</th><th>操作</th></tr></thead>
         <tbody id="models-tbody"></tbody>
       </table>
       <div id="models-empty" class="empty" style="display:none">暂无映射，点击上方按钮添加</div>
@@ -420,13 +434,14 @@ tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
 
 <!-- 角色映射 Modal（独立弹窗，支持多条规则） -->
 <div class="modal-overlay" id="role-map-modal">
-  <div class="modal" style="width:480px">
+  <div class="modal" style="width:500px">
     <h3>角色映射</h3>
     <input type="hidden" id="rm-mapping-id">
-    <p style="font-size:12px;color:var(--text2);margin-bottom:12px">将请求中指定角色的消息替换为目标角色，仅对当前提供商的当前模型生效。<br>例如：部分上游不支持 <code>developer</code> 角色，可映射为 <code>system</code>。</p>
-    <div id="rm-rules-list"></div>
-    <button class="btn btn-sm" style="background:var(--border);color:var(--text);margin-top:8px" onclick="addRoleMapRow()">+ 添加规则</button>
-    <div class="form-actions" style="margin-top:16px">
+    <div class="rm-tip">将请求中指定角色的消息替换为目标角色，仅对当前提供商的当前模型生效。例如：部分上游不支持 <code>developer</code> 角色，可映射为 <code>system</code>。</div>
+    <div id="rm-rules-list" class="rm-rules-list"></div>
+    <div id="rm-empty" class="rm-empty" style="display:none">暂无映射规则，点击下方按钮添加一条</div>
+    <button class="btn btn-sm rm-add" onclick="addRoleMapRow()">+ 添加规则</button>
+    <div class="form-actions" style="margin-top:18px">
       <button class="btn" style="background:var(--border);color:var(--text)" onclick="closeRoleMapModal()">取消</button>
       <button class="btn btn-primary" onclick="saveRoleMap()">保存</button>
     </div>
@@ -742,8 +757,8 @@ async function loadModels(){
         <td>${m.max_tokens>0?`<code>${m.max_tokens}</code>`:'<span style="color:var(--text2)">默认</span>'}</td>
         <td>${esc(m.provider_name||'未知')}</td>
         <td>${roleMapCell(m)}</td>
-        <td style="white-space:nowrap"><label class="toggle" title="${m.enabled?'点击禁用':'点击启用'}"><input type="checkbox" ${m.enabled?'checked':''} onchange="toggleModel(${m.id},this.checked)"><span class="toggle-slider"></span></label> <span class="badge ${m.enabled?'badge-success':'badge-error'}" style="margin-left:4px">${m.enabled?'启用':'禁用'}</span></td>
         <td style="white-space:nowrap" data-deg-cell="${esc(degKey)}">${degradationCell(degKey)}</td>
+        <td style="white-space:nowrap"><label class="toggle" title="${m.enabled?'点击禁用':'点击启用'}"><input type="checkbox" ${m.enabled?'checked':''} onchange="toggleModel(${m.id},this.checked)"><span class="toggle-slider"></span></label> <span class="badge ${m.enabled?'badge-success':'badge-error'}" style="margin-left:4px">${m.enabled?'启用':'禁用'}</span></td>
         <td>
           <button class="btn btn-sm" style="background:var(--border);color:var(--text)" onclick="editModel(_dataStore.models[${_store('models',m)}])">编辑</button>
           <button class="btn btn-sm" style="background:rgba(16,185,129,.15);color:#10b981" onclick="openCodexConfigModal(_dataStore.models[${_store('models',m)}])">Codex配置</button>
@@ -853,18 +868,28 @@ function openRoleMapModal(m){
   list.innerHTML='';
   if(!rules.length)rules=[{from:'',to:''}];
   rules.forEach(r=>addRoleMapRow(r.from||'',r.to||''));
+  refreshRmEmpty();
   document.getElementById('role-map-modal').classList.add('active');
 }
 function closeRoleMapModal(){document.getElementById('role-map-modal').classList.remove('active')}
+function refreshRmEmpty(){
+  const list=document.getElementById('rm-rules-list');
+  document.getElementById('rm-empty').style.display=list.children.length?'none':'block';
+}
 function addRoleMapRow(from,to){
   from=from||'';to=to||'';
   const div=document.createElement('div');
-  div.style.cssText='display:flex;gap:8px;align-items:center;margin-bottom:8px';
-  div.innerHTML='<input class="rm-from" placeholder="原角色（如 developer）" style="flex:1" value="'+esc(from)+'">'+
-    '<span style="color:var(--text2);font-size:16px">&rarr;</span>'+
-    '<input class="rm-to" placeholder="目标角色（如 system）" style="flex:1" value="'+esc(to)+'">'+
-    '<button class="btn btn-sm btn-danger" type="button" onclick="this.parentElement.remove()">✕</button>';
+  div.className='rm-row';
+  div.innerHTML='<input class="rm-from" placeholder="原角色（如 developer）" value="'+esc(from)+'">'+
+    '<span class="rm-arrow">&rarr;</span>'+
+    '<input class="rm-to" placeholder="目标角色（如 system）" value="'+esc(to)+'">'+
+    '<button class="btn btn-sm btn-danger rm-del" type="button" onclick="removeRoleMapRow(this)">✕</button>';
   document.getElementById('rm-rules-list').appendChild(div);
+  refreshRmEmpty();
+}
+function removeRoleMapRow(btn){
+  btn.parentElement.remove();
+  refreshRmEmpty();
 }
 async function saveRoleMap(){
   const id=document.getElementById('rm-mapping-id').value;
