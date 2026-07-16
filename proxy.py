@@ -2680,17 +2680,26 @@ def _stream_response_openai_to_responses(url, headers, body, provider, target_mo
                 reader_thread.join(timeout=2)
             except Exception:
                 pass
+            # 主生成器主动结束流（exit=normal）后，finally 调 resp.close() 会让后台线程的
+            # iter_lines 因 resp.raw 被置空而抛错（典型：AttributeError: 'NoneType' object
+            # has no attribute 'readline'）。这属于主动关闭引起的预期异常，不是上游故障，
+            # 清空以免正常请求被误报 upstream_err。真正的上游异常会经 raise item[1] 让
+            # exit_reason 变为 conn_abort/exception，那种情况保留 upstream_error_type。
+            if exit_reason == "normal":
+                upstream_error_type = None
             _release_concurrency(provider["id"], sem)
             status = "error" if error_msg else "success"
             # 流式诊断：记录 generate 在何处/因何因退出，定位 codex reasoning 阶段卡死。
-            # 无论 success/error 都写入 error_msg 字段 + print 控制台，便于 web UI / sqlite / 控制台排查。
+            # 始终 print 到控制台便于排障；但仅在出错（status=error，error_msg 非空）时
+            # 才把 diag 写入 DB 的 error_msg 字段 —— web UI 详情框只要 error_msg 非空就以
+            # 红色"错误:"块展示（templates/index.html），成功请求若写入此串会被误判为错误。
             diag = (f"[exit={exit_reason} completed_sent={completed_sent} "
                     f"upstream_done={upstream_done_received} upstream_err={upstream_error_type} "
                     f"reasoning_opened={reasoning_opened} text_opened={text_item_opened} "
                     f"tools={len(tool_call_order)} finish_reason={finish_reason} "
                     f"in={input_tokens} out={output_tokens}]")
             print(f"[codex-stream-diag] resp={response_id} {diag}", flush=True)
-            log_error_msg = f"{diag} {error_msg}" if error_msg else diag
+            log_error_msg = f"{diag} {error_msg}" if error_msg else ""
             config.add_log(
                 provider=provider["name"], model=target_model, source_model=source_model,
                 input_tokens=input_tokens, output_tokens=output_tokens,
