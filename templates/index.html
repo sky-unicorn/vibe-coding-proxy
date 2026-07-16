@@ -204,7 +204,7 @@ tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
         <span id="degradation-info" class="save-info"></span>
       </div>
       <table>
-        <thead><tr><th>别名</th><th>优先级</th><th>目标模型</th><th>模型类型</th><th>max_tokens</th><th>提供商</th><th>角色映射</th><th>状态</th><th>降级状态</th><th>操作</th></tr></thead>
+        <thead><tr><th>别名</th><th>优先级</th><th>目标模型</th><th>模型类型</th><th>最大输出 Token 数</th><th>提供商</th><th>角色映射</th><th>状态</th><th>降级状态</th><th>操作</th></tr></thead>
         <tbody id="models-tbody"></tbody>
       </table>
       <div id="models-empty" class="empty" style="display:none">暂无映射，点击上方按钮添加</div>
@@ -353,7 +353,7 @@ tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
     <div class="form-group"><label>优先级（数值越小优先级越高）</label><input id="mf-priority" type="number" min="1" value="1" placeholder="1"><span style="font-size:11px;color:var(--text2);margin-top:2px;display:block">同一别名下，优先级高的模型获得更多流量，但所有模型都会被使用</span></div>
     <div class="form-group"><label>目标模型</label><input id="mf-target" placeholder="如: claude-sonnet-4-20250514 或 gpt-4o"></div>
     <div class="form-group"><label>模型类型</label><select id="mf-model-type"><option value="text">文本模型</option><option value="multimodal">多模态模型</option></select><span style="font-size:11px;color:var(--text2);margin-top:2px;display:block">多模态模型会保留图片内容，文本模型会自动移除图片</span></div>
-    <div class="form-group"><label>max_tokens</label><input id="mf-max-tokens" type="number" min="0" value="0" placeholder="0"><span style="font-size:11px;color:var(--text2);margin-top:2px;display:block">留 0 或不填则使用默认值（Anthropic 直转默认 128000，格式转换默认 4096）</span></div>
+    <div class="form-group"><label>最大输出 Token 数</label><input id="mf-max-tokens" type="number" min="0" value="0" placeholder="0"><span style="font-size:11px;color:var(--text2);margin-top:2px;display:block">替换调用方传入的最大输出 token 数，若调用方原值上游能正常处理，留 0 或空即可。当调用方传入超限上游报错时才需配置：如模型kimi-2.7上限 32768，调用方却传 64000 导致报错，则填 32768</span></div>
     <div class="form-group"><label>提供商</label><select id="mf-provider"></select></div>
     <div class="form-group" style="display:flex;align-items:center;gap:8px">
       <label class="toggle"><input type="checkbox" id="mf-enabled" checked><span class="toggle-slider"></span></label>
