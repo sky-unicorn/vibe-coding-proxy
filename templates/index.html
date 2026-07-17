@@ -205,11 +205,15 @@ tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
         <h2>模型映射</h2>
         <button class="btn btn-primary" onclick="openModelModal()">添加映射</button>
       </div>
-      <p style="font-size:13px;color:var(--text2);margin-bottom:12px">将请求中的模型名映射到实际的模型和提供商。同一别名可配置多条映射，系统会按优先级加权轮询，并自动选并发最低的提供商。</p>
+      <p style="font-size:13px;color:var(--text2);margin-bottom:12px">将请求中的模型名映射到实际的模型和提供商。同一别名可配置多条映射，系统会按优先级加权轮询，并自动选并发最低的提供商。开启严格优先级后，仅在当前最高优先级层内选择，整层降级才下放到更低优先级层。</p>
       <div class="degradation-bar">
         <div class="item">
           <label class="toggle"><input type="checkbox" id="degradation-enabled"><span class="toggle-slider"></span></label>
           <span>启用服务降级</span>
+        </div>
+        <div class="item">
+          <label class="toggle"><input type="checkbox" id="degradation-strict"><span class="toggle-slider"></span></label>
+          <span>严格优先级（逐级下放）</span>
         </div>
         <div class="item">
           降级持续 <input type="number" id="degradation-duration" value="30" min="1"> 秒
@@ -776,11 +780,15 @@ async function loadDegradationSettings(){
     const en=s.degradation_enabled;
     document.getElementById('degradation-enabled').checked= en==='1'||en===1||en===true||String(en).toLowerCase()==='true';
     document.getElementById('degradation-duration').value=s.degradation_duration||30;
+    const sp=s.degradation_strict_priority;
+    document.getElementById('degradation-strict').checked= sp==='1'||sp===1||sp===true||String(sp).toLowerCase()==='true';
+    document.getElementById('degradation-strict').disabled=!document.getElementById('degradation-enabled').checked;
   }catch(e){}
 }
 async function saveDegradationSettings(){
   const data={
     degradation_enabled:document.getElementById('degradation-enabled').checked?'1':'0',
+    degradation_strict_priority:document.getElementById('degradation-strict').checked?'1':'0',
     degradation_duration:parseInt(document.getElementById('degradation-duration').value)||30,
   };
   try{
@@ -790,6 +798,10 @@ async function saveDegradationSettings(){
     refreshDegradation();
   }catch(e){alert('保存失败');}
 }
+document.getElementById('degradation-enabled').addEventListener('change',function(){
+  document.getElementById('degradation-strict').disabled=!this.checked;
+  if(!this.checked){document.getElementById('degradation-strict').checked=false;}
+});
 async function refreshDegradation(){
   try{
     const degRaw=await(await fetch(API+'/api/models/degradation')).json();

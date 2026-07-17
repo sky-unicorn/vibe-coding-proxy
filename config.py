@@ -1658,6 +1658,7 @@ def get_degradation_config():
     返回 dict：
       - enabled: bool，是否启用降级（默认 False，需在 UI 主动打开）。
       - duration: int，单次降级持续秒数（默认 30，UI 可改）。
+      - strict_priority: bool，是否启用严格优先级（逐级下放）模式（默认 False）。开启后仅在当前最高优先级层内选择候选，整层降级才下放到更低优先级层；依赖主降级开关 enabled=True 方可生效。
 
     降级语义：单次转发请求在 _post_with_retry 内部重试 3 次仍失败，
     即按具体 model_mapping（provider+目标模型）粒度标记降级，在 duration 秒内
@@ -1666,6 +1667,7 @@ def get_degradation_config():
     """
     enabled_raw = get_setting("degradation_enabled", "0")
     duration_raw = get_setting("degradation_duration", "30")
+    strict_raw = get_setting("degradation_strict_priority", "0")
     try:
         duration = int(duration_raw)
     except (ValueError, TypeError):
@@ -1675,6 +1677,7 @@ def get_degradation_config():
     return {
         "enabled": enabled_raw not in ("0", "false", "False", ""),
         "duration": duration,
+        "strict_priority": strict_raw not in ("0", "false", "False", ""),
     }
 
 
@@ -2177,4 +2180,5 @@ def _migrate_degradation_settings(conn):
     # 确保默认值存在（INSERT OR IGNORE 不覆盖已有值，避免覆盖用户自定义设置）
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('degradation_enabled', '0')")
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('degradation_duration', '30')")
+    conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('degradation_strict_priority', '0')")
     conn.commit()

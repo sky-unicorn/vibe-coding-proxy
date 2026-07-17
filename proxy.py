@@ -469,6 +469,31 @@ def _filter_candidates_by_degradation(candidates, cfg=None):
     return candidates
 
 
+def _select_strict_priority_candidates(candidates, cfg=None):
+    """严格优先级（逐级下放）选池。仅在主降级开关 + strict_priority 均开启时由调用方使用。
+
+    从最高优先级层（priority 数值最小）起，层内非降级候选非空 → 只返回该层非降级候选；
+    整层全降级 → 下放到下一更低的优先级层；所有层全降级 → 回退全量池（含降级候选），
+    保证不拒服务。候选键兼容 Anthropic 的 "id" 与 OpenAI 的 "mapping_id"。
+    """
+    if cfg is None:
+        cfg = get_degradation_config()
+    if not candidates:
+        return []
+    priorities = sorted({c.get("priority", 1) for c in candidates})
+    for p in priorities:
+        layer = [c for c in candidates if c.get("priority", 1) == p]
+        non_degraded = [c for c in layer if not is_degraded(c.get("id") or c.get("mapping_id"))]
+        if non_degraded:
+            return non_degraded
+    # 所有层全降级：回退全量池
+    degraded_ids = sorted({c.get("id") or c.get("mapping_id") for c in candidates
+                           if (c.get("id") or c.get("mapping_id"))})
+    print(f"[降级·严格优先级] 所有层均已降级，回退全量池。mapping_ids={degraded_ids} "
+          f"duration={cfg.get('duration')}s")
+    return candidates
+
+
 # ---- 响应判断辅助 ----
 
 def _is_streaming_response(response):
@@ -604,7 +629,10 @@ def handle_proxy_request(request_body, client_ip=""):
         untried = [c for c in candidates if c.get("id") not in attempted]
         if not untried:
             break
-        filtered = _filter_candidates_by_degradation(untried, cfg)
+        if cfg.get("enabled") and cfg.get("strict_priority"):
+            filtered = _select_strict_priority_candidates(untried, cfg)
+        else:
+            filtered = _filter_candidates_by_degradation(untried, cfg)
         if not filtered:
             break
         chosen = _pick_weighted_round_robin(filtered, client_ip, model)
@@ -801,7 +829,10 @@ def handle_openai_proxy_request(request_body, client_ip=""):
         untried = [c for c in candidates if c["mapping_id"] not in attempted]
         if not untried:
             break
-        filtered = _filter_candidates_by_degradation(untried, cfg)
+        if cfg.get("enabled") and cfg.get("strict_priority"):
+            filtered = _select_strict_priority_candidates(untried, cfg)
+        else:
+            filtered = _filter_candidates_by_degradation(untried, cfg)
         if not filtered:
             break
         chosen = _pick_weighted_round_robin(filtered, client_ip, model)
@@ -2760,7 +2791,10 @@ def handle_openai_responses_request(request_body, client_ip=""):
         untried = [c for c in candidates if c["mapping_id"] not in attempted]
         if not untried:
             break
-        filtered = _filter_candidates_by_degradation(untried, cfg)
+        if cfg.get("enabled") and cfg.get("strict_priority"):
+            filtered = _select_strict_priority_candidates(untried, cfg)
+        else:
+            filtered = _filter_candidates_by_degradation(untried, cfg)
         if not filtered:
             break
         chosen = _pick_weighted_round_robin(filtered, client_ip, model)
