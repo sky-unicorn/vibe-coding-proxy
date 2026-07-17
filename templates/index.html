@@ -566,6 +566,7 @@ function switchTab(name){
   document.querySelectorAll('.tab').forEach((t,i)=>{t.classList.toggle('active',['providers','models','errors','logs','apikeys','billing','mcp'][i]===name)});
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   document.getElementById('panel-'+name).classList.add('active');
+  if(location.hash!=='#'+name) history.replaceState(null,'','#'+name);
   if(name==='providers') loadProviders();
   if(name==='models'){loadDegradationSettings();loadModels();}
   if(name==='errors') loadErrors();
@@ -573,6 +574,11 @@ function switchTab(name){
   if(name==='apikeys') loadApiKeys();
   if(name==='billing') loadBillingOverview();
 }
+window.addEventListener('DOMContentLoaded',()=>{
+  const h=location.hash.replace('#','');
+  const valid=['providers','models','errors','logs','apikeys','billing','mcp'];
+  if(valid.includes(h)) switchTab(h);
+});
 
 // ---- Providers ----
 let _concurrencyData={};
