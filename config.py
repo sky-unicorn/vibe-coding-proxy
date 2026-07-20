@@ -994,6 +994,38 @@ def _migrate_model_mappings_add_disable_reason(conn):
         raise RuntimeError(f"model_mappings 迁移后存在 {empty_alias} 行空 alias")
 
 
+def _migrate_reconcile_disabled_provider_mappings(conn):
+    """v6->v7：修正历史数据--provider 禁用但其下 mapping 仍 enabled=1 的假启用残留。
+
+    背景：v6 引入 disable_reason 列前，provider 禁用不会级联到 mapping（当时无级联
+    机制）。老库迁移到 v6 时回填只看 mapping 自身 enabled，未参考 provider 状态，
+    导致「provider 禁用但 mapping enabled=1 disable_reason=''」的假启用残留：UI 显示
+    启用，却因路由层 get_model_mapping_by_alias 的 p.enabled=1 过滤而实际无效。
+    本迁移把这些 mapping 修正为 enabled=0 disable_reason='provider_disabled'，与
+    _cascade_provider_enabled_to_mappings 的级联禁用语义对齐。
+
+    纯数据修正，不改表结构。幂等保证：
+      - settings 标记键做一次性守卫，已执行则直接 return；
+      - UPDATE 本身也只命中 enabled=1 且 provider 禁用的不一致行，重复执行无副作用。
+    特征检测用 settings 标记键（纯数据迁移无列/索引/表结构特征可检测）。
+    """
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key = 'migrate_reconcile_disabled_provider_mappings_done'"
+    ).fetchone()
+    if row:
+        return  # 幂等：已执行过
+
+    conn.execute(
+        "UPDATE model_mappings SET enabled = 0, disable_reason = 'provider_disabled' "
+        "WHERE enabled = 1 AND provider_id IN (SELECT id FROM providers WHERE enabled = 0)"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) "
+        "VALUES ('migrate_reconcile_disabled_provider_mappings_done', '1')"
+    )
+    conn.commit()
+
+
 def _create_latest_schema(conn):
     """用最新 schema 创建所有表（CREATE TABLE IF NOT EXISTS）。
 
@@ -1255,6 +1287,11 @@ _MIGRATIONS = [
         "model_mappings 新增 disable_reason 列以区分手动禁用与 provider 联动禁用",
         _migrate_model_mappings_add_disable_reason,
     ),
+    (
+        7,
+        "修正 provider 禁用但其下 mapping 仍启用的历史假启用数据",
+        _migrate_reconcile_disabled_provider_mappings,
+    ),
 ]
 
 CURRENT_SCHEMA_VERSION = len(_MIGRATIONS)
@@ -1365,6 +1402,13 @@ def _calibrate_user_version(conn):
         detected = 5  # v5 标志列存在；v5 隐含 v4/v3/v2/v1
     if "disable_reason" in cols_mm:
         detected = 6  # v6 标志列存在；v6 隐含 v5/v4/v3/v2/v1
+    # v7 是纯数据迁移（无列/索引/表结构变更），特征痕迹只有 settings 标记键。
+    # 用 sqlite_master 查 settings 不适用，settings 是普通表，直接 SELECT 即可。
+    v7_done = conn.execute(
+        "SELECT value FROM settings WHERE key = 'migrate_reconcile_disabled_provider_mappings_done'"
+    ).fetchone()
+    if v7_done:
+        detected = 7  # v7 标记键存在；v7 隐含 v6/v5/v4/v3/v2/v1
     current = conn.execute("PRAGMA user_version").fetchone()[0]
     if detected > current:
         conn.execute(f"PRAGMA user_version = {detected}")
@@ -1452,6 +1496,15 @@ def init_db():
             # 对自定义端点无保护，会错误追加后缀，永久篡改用户配置的 URL，导致转发失败。
             conn.execute(
                 "INSERT OR REPLACE INTO settings (key,value) VALUES ('baseline_url_full_endpoint_done','1')"
+            )
+            # v7 数据修正迁移标记：与 is_fresh 分支同步补写，保持与老库分支
+            # _calibrate_user_version 的特征检测一致。全新库无 provider 禁用的
+            # 历史不一致数据，v7 UPDATE 在全新库上不会命中任何行，标记写在这里仅
+            # 是为了让 _calibrate_user_version 在二次启动时直接识别为 v7，避免
+            # 因标记缺失误判为 v6（虽不影响 run_migrations 行为，但保持版本号校准一致）。
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key,value) "
+                "VALUES ('migrate_reconcile_disabled_provider_mappings_done','1')"
             )
             conn.commit()
         else:
