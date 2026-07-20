@@ -352,7 +352,11 @@ def api_add_model():
 @app.route("/api/models/<int:mapping_id>", methods=["PUT"])
 def api_update_model(mapping_id):
     data = request.get_json(force=True)
-    config.update_model_mapping(mapping_id, **data)
+    try:
+        config.update_model_mapping(mapping_id, **data)
+    except ValueError as e:
+        # 业务校验失败（如 provider 禁用时尝试开启 mapping），返回 400 + 错误信息
+        return jsonify({"ok": False, "error": str(e)}), 400
     return jsonify({"ok": True})
 
 

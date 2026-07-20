@@ -1581,7 +1581,7 @@ def delete_provider(provider_id):
 def get_model_mappings():
     conn = get_conn()
     rows = conn.execute(
-        "SELECT m.*, p.name as provider_name, p.anthropic_url, p.openai_url, p.api_key "
+        "SELECT m.*, p.name as provider_name, p.enabled as provider_enabled, p.anthropic_url, p.openai_url, p.api_key "
         "FROM model_mappings m LEFT JOIN providers p ON m.provider_id = p.id "
         "ORDER BY m.alias ASC, m.priority ASC, m.id ASC"
     ).fetchall()
@@ -1658,6 +1658,21 @@ def update_model_mapping(mapping_id, **kwargs):
         return
     values.append(mapping_id)
     conn = get_conn()
+    # 防御性检查：所属 provider 被禁用时，禁止开启 mapping。
+    # 与前端 toggle 锁定语义一致——provider 禁用其下 mapping 一律不能为启用态，
+    # 否则会出现「toggle 显示启用但路由被 p.enabled=1 过滤、实际无效」的假启用。
+    # 禁用（enabled=0）或其他字段更新不受限制。
+    if "enabled" in kwargs and int(kwargs["enabled"]):
+        prov = conn.execute(
+            "SELECT p.enabled, p.name FROM model_mappings m "
+            "JOIN providers p ON m.provider_id = p.id WHERE m.id = ?",
+            (mapping_id,),
+        ).fetchone()
+        if prov and int(prov["enabled"]) == 0:
+            conn.close()
+            raise ValueError(
+                f"该映射模型所属提供商「{prov['name']}」已禁用，无法开启，请先启用提供商"
+            )
     conn.execute(f"UPDATE model_mappings SET {', '.join(fields)} WHERE id = ?", values)
     conn.commit()
     conn.close()

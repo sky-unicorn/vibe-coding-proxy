@@ -123,6 +123,8 @@ tr:hover{background:rgba(99,102,241,.05)}
 .toggle-slider:before{content:'';position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:.3s}
 .toggle input:checked+.toggle-slider{background:rgba(34,197,94,.5)}
 .toggle input:checked+.toggle-slider:before{transform:translateX(18px)}
+.toggle.toggle-locked{cursor:not-allowed;opacity:.5}
+.toggle.toggle-locked .toggle-slider{background:rgba(120,120,120,.35)}
 /* Billing */
 .badge-billing-none{background:rgba(34,197,94,.15);color:var(--success)}
 .badge-billing-request_count{background:rgba(245,158,11,.15);color:var(--warn)}
@@ -395,10 +397,10 @@ tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
     <div class="form-group"><label>目标模型</label><input id="mf-target" placeholder="如: claude-sonnet-4-20250514 或 gpt-4o"></div>
     <div class="form-group"><label>模型类型</label><select id="mf-model-type"><option value="text">文本模型</option><option value="multimodal">多模态模型</option></select><span style="font-size:11px;color:var(--text2);margin-top:2px;display:block">多模态模型会保留图片内容，文本模型会自动移除图片</span></div>
     <div class="form-group"><label>最大输出 Token 数</label><input id="mf-max-tokens" type="number" min="0" value="0" placeholder="0"><span style="font-size:11px;color:var(--text2);margin-top:2px;display:block">替换调用方传入的最大输出 token 数，若调用方原值上游能正常处理，留 0 或空即可。当调用方传入超限上游报错时才需配置：如模型kimi-2.7上限 32768，调用方却传 64000 导致报错，则填 32768</span></div>
-    <div class="form-group"><label>提供商</label><select id="mf-provider"></select></div>
+    <div class="form-group"><label>提供商</label><select id="mf-provider" onchange="syncModelEnabledLock()"></select></div>
     <div class="form-group" style="display:flex;align-items:center;gap:8px">
       <label class="toggle"><input type="checkbox" id="mf-enabled" checked><span class="toggle-slider"></span></label>
-      <span style="font-size:13px">启用</span>
+      <span id="mf-enabled-label" style="font-size:13px">启用</span>
     </div>
     <div class="form-actions">
       <button class="btn" style="background:var(--border);color:var(--text)" onclick="closeModelModal()">取消</button>
@@ -782,16 +784,18 @@ async function loadModels(){
     for(const m of pool){
       // 降级状态查询键：后端按 mapping_id（即 m.id）返回，每行独立
       const degKey=String(m.id);
+      // 所属 provider 是否被禁用：禁用时锁定 toggle、不允许开启（与后端拦截语义一致）
+      const provDisabled=!m.provider_enabled||Number(m.provider_enabled)===0;
       rows+=`<tr data-alias="${esc(aliasName)}" style="--alias-rgb:${color}">
         <td><span class="alias-badge" style="--alias-rgb:${color}"><span class="alias-color-dot"></span>${esc(m.alias)}</span></td>
         <td>${m.priority!=null?`<span class="badge" style="background:rgba(${color},.35);color:rgb(${color})">${m.priority}</span>`:'<span style="color:var(--text2)">1</span>'}</td>
         <td><code>${esc(m.target_model)}</code></td>
         <td>${m.model_type==='multimodal'?'<span class="badge" style="background:#6366f1;color:#fff">多模态</span>':'<span class="badge" style="background:var(--border);color:var(--text)">文本</span>'}</td>
         <td>${m.max_tokens>0?`<code>${m.max_tokens}</code>`:'<span style="color:var(--text2)">默认</span>'}</td>
-        <td>${esc(m.provider_name||'未知')}</td>
+        <td>${esc(m.provider_name||'未知')}${provDisabled?' <span class="badge badge-error" style="font-size:10px;padding:1px 5px">提供商已禁用</span>':''}</td>
         <td>${roleMapCell(m)}</td>
         <td style="white-space:nowrap" data-deg-cell="${esc(degKey)}">${degradationCell(degKey)}</td>
-        <td style="white-space:nowrap"><label class="toggle" title="${m.enabled?'点击禁用':'点击启用'}"><input type="checkbox" ${m.enabled?'checked':''} onchange="toggleModel(${m.id},this.checked)"><span class="toggle-slider"></span></label> <span class="badge ${m.enabled?'badge-success':'badge-error'}" style="margin-left:4px">${m.enabled?'启用':'禁用'}</span></td>
+        <td style="white-space:nowrap"><label class="toggle ${provDisabled?'toggle-locked':''}" title="${provDisabled?'提供商已禁用，请先启用提供商':(m.enabled?'点击禁用':'点击启用')}"><input type="checkbox" ${m.enabled?'checked':''} ${provDisabled?'disabled':''} onchange="toggleModel(${m.id},this.checked)"><span class="toggle-slider"></span></label> <span class="badge ${m.enabled?'badge-success':'badge-error'}" style="margin-left:4px">${m.enabled?'启用':'禁用'}</span></td>
         <td>
           <button class="btn btn-sm" style="background:var(--border);color:var(--text)" onclick="editModel(_dataStore.models[${_store('models',m)}])">编辑</button>
           <button class="btn btn-sm" style="background:rgba(16,185,129,.15);color:#10b981" onclick="openCodexConfigModal(_dataStore.models[${_store('models',m)}])">Codex配置</button>
@@ -881,7 +885,7 @@ async function refreshDegradation(){
 }
 async function openModelModal(m){
   const providers=await(await fetch(API+'/api/providers')).json();
-  document.getElementById('mf-provider').innerHTML=providers.map(p=>`<option value="${p.id}">${esc(p.name)}${formatProviderProtocols(p)}</option>`).join('');
+  document.getElementById('mf-provider').innerHTML=providers.map(p=>`<option value="${p.id}" data-enabled="${p.enabled?1:0}">${esc(p.name)}${formatProviderProtocols(p)}</option>`).join('');
   document.getElementById('model-modal-title').textContent=m?'编辑映射':'添加映射';
   document.getElementById('model-edit-id').value=m?m.id:'';
   document.getElementById('mf-alias').value=m?m.alias:'';
@@ -891,7 +895,31 @@ async function openModelModal(m){
   document.getElementById('mf-max-tokens').value=m?m.max_tokens:0;
   document.getElementById('mf-provider').value=m?m.provider_id:(providers[0]?.id||'');
   document.getElementById('mf-enabled').checked=m?m.enabled:true;
+  syncModelEnabledLock();
   document.getElementById('model-modal').classList.add('active');
+}
+// 根据当前所选提供商的启停状态，联动锁定/解锁「启用」开关。
+// provider 禁用时，其下 mapping 一律不能为启用态（与列表 toggle 锁定、后端拦截语义一致）。
+function syncModelEnabledLock(){
+  const sel=document.getElementById('mf-provider');
+  const opt=sel.options[sel.selectedIndex];
+  if(!opt) return;
+  const provEnabled=opt.dataset.enabled!=='0';
+  const en=document.getElementById('mf-enabled');
+  const lbl=document.getElementById('mf-enabled-label');
+  const toggle=en.closest('.toggle');
+  if(provEnabled){
+    en.disabled=false;
+    toggle.classList.remove('toggle-locked');
+    lbl.textContent='启用';
+    lbl.style.color='';
+  }else{
+    en.disabled=true;
+    en.checked=false;
+    toggle.classList.add('toggle-locked');
+    lbl.textContent='启用（提供商已禁用，请先启用提供商）';
+    lbl.style.color='#f59e0b';
+  }
 }
 function closeModelModal(){document.getElementById('model-modal').classList.remove('active')}
 function editModel(m){openModelModal(m)}
@@ -906,7 +934,7 @@ async function saveModel(){
     provider_id:parseInt(document.getElementById('mf-provider').value),
     enabled:document.getElementById('mf-enabled').checked,
   };
-  if(id) await fetch(API+'/api/models/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+  if(id){const r=await fetch(API+'/api/models/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});if(!r.ok){const j=await r.json().catch(()=>({}));showFeatureToast('保存失败',j.error||'操作失败');return}}
   else await fetch(API+'/api/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
   closeModelModal();loadModels();
 }
@@ -1238,7 +1266,11 @@ async function toggleProvider(id,enabled){
     ? '该提供商下所有映射模型已同步置为<strong>启用</strong>。'
     : '该提供商下所有映射模型已同步置为<strong>停用</strong>。');
 }
-async function toggleModel(id,enabled){await fetch(API+'/api/models/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});loadModels()}
+async function toggleModel(id,enabled){
+  const r=await fetch(API+'/api/models/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
+  if(!r.ok){const j=await r.json().catch(()=>({}));showFeatureToast('开启失败',j.error||'操作失败');loadModels();return}
+  loadModels()
+}
 async function toggleError(id,enabled){await fetch(API+'/api/error-mappings/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});loadErrors()}
 
 // ---- API Keys ----
