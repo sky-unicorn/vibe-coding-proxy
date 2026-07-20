@@ -12,6 +12,15 @@
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
 .header{background:var(--card);border-bottom:1px solid var(--border);padding:16px 24px;display:flex;align-items:center;justify-content:space-between}
 .header h1{font-size:20px;font-weight:600}
+.ver-badge{display:inline-block;margin-left:10px;padding:2px 9px;border-radius:10px;font-size:11px;font-weight:500;vertical-align:middle;cursor:default;border:1px solid var(--border);background:var(--bg);color:var(--text2);transition:all .15s}
+.ver-badge.ver-loading{opacity:.5}
+.ver-badge.ver-latest{background:rgba(34,197,94,.15);color:var(--success);border-color:transparent}
+.ver-badge.ver-new{background:rgba(245,158,11,.18);color:var(--warn);border-color:transparent;cursor:pointer}
+.ver-badge.ver-new:hover{background:rgba(245,158,11,.3)}
+.ver-refresh-btn{background:transparent;color:var(--text2);border:1px solid var(--border);padding:4px 8px;line-height:1}
+.ver-refresh-btn:hover{color:var(--text);border-color:var(--primary)}
+.ver-refresh-btn.spinning{animation:verSpin .8s linear infinite}
+@keyframes verSpin{to{transform:rotate(360deg)}}
 .header .info{font-size:13px;color:var(--text2)}
 .url-bar{display:flex;gap:12px;margin-top:10px;flex-wrap:wrap}
 .url-item{display:flex;align-items:center;gap:6px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:12px}
@@ -175,13 +184,14 @@ tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
 <body>
 
 <div class="header">
-  <h1>Vibe Coding 服务转发</h1>
+  <h1>Vibe Coding 服务转发<span id="version-badge" class="ver-badge ver-loading" title="检查更新中…">v?</span></h1>
   <div style="display:flex;align-items:center;gap:12px">
     <div class="url-bar">
       <div class="url-item"><span class="url-label anthropic">Anthropic</span> <code id="url-anthropic"></code> <button class="copy-btn" onclick="copyUrl('url-anthropic')">复制</button></div>
       <div class="url-item"><span class="url-label openai">OpenAiChat</span> <code id="url-openai-chat"></code> <button class="copy-btn" onclick="copyUrl('url-openai-chat')">复制</button></div>
       <div class="url-item"><span class="url-label openai">OpenAiResponses</span> <code id="url-openai-responses"></code> <button class="copy-btn" onclick="copyUrl('url-openai-responses')">复制</button></div>
     </div>
+    <button class="btn btn-sm ver-refresh-btn" id="ver-refresh-btn" title="重新检查最新版本" onclick="refreshVersionInfo(true)">⟳</button>
     <button class="btn btn-danger btn-sm" onclick="logout()">登出</button>
   </div>
 </div>
@@ -1452,10 +1462,42 @@ function initUrls(){
   document.getElementById('url-openai-responses').textContent=base+'/openai';
 }
 
+// 版本徽章：检查更新
+function applyVersionBadge(info){
+  const badge=document.getElementById('version-badge');
+  if(!badge||!info)return;
+  badge.onclick=null;
+  if(info.has_update===true){
+    badge.className='ver-badge ver-new';
+    badge.innerHTML='🆕 有新版本 v'+info.latest;
+    badge.title='点击前往 GitHub 下载最新版本';
+    badge.onclick=()=>window.open(info.latest_url||info.releases_url,'_blank');
+  }else if(info.has_update===false){
+    badge.className='ver-badge ver-latest';
+    badge.textContent='✓ 已是最新版 (v'+info.current+')';
+    badge.title='当前版本 v'+info.current;
+  }else{
+    badge.className='ver-badge';
+    badge.textContent='v'+info.current;
+    badge.title='当前版本 v'+info.current+'（未能获取最新版本信息）';
+  }
+}
+async function refreshVersionInfo(force){
+  const btn=document.getElementById('ver-refresh-btn');
+  if(btn)btn.classList.add('spinning');
+  try{
+    const url=API+'/api/version'+(force?('?force=1&t='+Date.now()):'');
+    const r=await fetch(url);
+    if(r.ok)applyVersionBadge(await r.json());
+  }catch(e){/* 静默：徽章保留当前版本字样 */}
+  finally{if(btn)btn.classList.remove('spinning');}
+}
+
 // Init
 initUrls();
 loadProviders();
 loadCleanupSettings();
+refreshVersionInfo(false);
 
 // 定时刷新并发状态（仅当提供商 tab 激活时）
 setInterval(()=>{

@@ -8,6 +8,7 @@ from flask import Flask, request, jsonify, Response, render_template, session, r
 import config
 import proxy
 import oauth
+from version import APP_VERSION, RELEASES_URL, GITHUB_LATEST_API
 
 # Windows 控制台默认用 GBK 编码，直接 print 中文会乱码；强制 stdout/stderr 用 UTF-8。
 if sys.platform == "win32":
@@ -435,6 +436,128 @@ def api_update_settings():
     for k, v in data.items():
         config.set_setting(k, v)
     return jsonify({"ok": True})
+
+
+# ---- Version / Update Check ----
+
+# 版本检查请求串行化，避免多 tab 并发重复打 GitHub API
+_version_lock = threading.Lock()
+_VERSION_CACHE_TTL = 3600        # 正常缓存 1 小时
+_VERSION_RATELIMIT_TTL = 86400   # 命中 403 限流时缓存 24 小时，避免反复撞墙
+
+
+def _parse_version(tag):
+    """'v1.2.2' 或 '1.2.2' -> (1, 2, 2)；非法返回空元组 ()"""
+    if not tag:
+        return ()
+    s = str(tag).strip().lstrip("vV")
+    parts = []
+    for p in s.split("."):
+        try:
+            parts.append(int(p))
+        except ValueError:
+            return ()
+    return tuple(parts)
+
+
+def _fetch_latest_release():
+    """请求 GitHub /releases/latest，3s 超时。
+
+    返回：
+      - (version_str, html_url)：成功，version_str 已去掉 v 前缀
+      - ("__rate_limited__", None)：命中 403 限流
+      - None：网络错误 / 非 200 / 解析失败
+    """
+    import requests
+    try:
+        r = requests.get(
+            GITHUB_LATEST_API,
+            timeout=3,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "vibe-coding-proxy",
+            },
+        )
+    except Exception:
+        return None
+    if r.status_code == 403:
+        return ("__rate_limited__", None)
+    if r.status_code != 200:
+        return None
+    try:
+        data = r.json()
+    except Exception:
+        return None
+    tag = data.get("tag_name", "")
+    url = data.get("html_url", RELEASES_URL)
+    v = _parse_version(tag)
+    return (tag.lstrip("vV"), url) if v else None
+
+
+@app.route("/api/version", methods=["GET"])
+def api_get_version():
+    """返回当前版本 + 最新版本对比结果。
+
+    命中 settings 缓存优先（1h TTL，限流时 24h），缓存过期才拉 GitHub。
+    force=1 跳过缓存立即重查。GitHub 不通时返回旧缓存 + has_update=null，
+    前端降级只显示当前版本号，永卡不了 UI。
+    """
+    import time as _t
+    now = _t.time()
+    force = request.args.get("force") == "1"
+
+    cached_at = float(config.get_setting("latest_release_checked_at", "0") or 0)
+    cached_ver = config.get_setting("latest_release_version", "")
+    cached_url = config.get_setting("latest_release_url", "")
+    cached_rl = config.get_setting("latest_release_rate_limited", "0") == "1"
+
+    ttl = _VERSION_RATELIMIT_TTL if cached_rl else _VERSION_CACHE_TTL
+    fresh = (not force) and bool(cached_at) and ((now - cached_at) < ttl)
+
+    latest = cached_ver
+    latest_url = cached_url or RELEASES_URL
+    checked_at = cached_at
+
+    if not fresh:
+        with _version_lock:
+            # double-check：拿到锁后缓存可能已被其他并发请求刷新
+            cached_at2 = float(config.get_setting("latest_release_checked_at", "0") or 0)
+            cached_rl2 = config.get_setting("latest_release_rate_limited", "0") == "1"
+            ttl2 = _VERSION_RATELIMIT_TTL if cached_rl2 else _VERSION_CACHE_TTL
+            if (not force) and cached_at2 and ((now - cached_at2) < ttl2) and cached_at2 > cached_at:
+                latest = config.get_setting("latest_release_version", "")
+                latest_url = config.get_setting("latest_release_url", "") or RELEASES_URL
+                checked_at = cached_at2
+            else:
+                res = _fetch_latest_release()
+                if res is None:
+                    pass  # 网络失败：保留旧缓存值，has_update 用旧值算
+                elif res[0] == "__rate_limited__":
+                    config.set_setting("latest_release_checked_at", str(now))
+                    config.set_setting("latest_release_rate_limited", "1")
+                    checked_at = now
+                else:
+                    latest, latest_url = res
+                    config.set_setting("latest_release_version", latest)
+                    config.set_setting("latest_release_url", latest_url)
+                    config.set_setting("latest_release_checked_at", str(now))
+                    config.set_setting("latest_release_rate_limited", "0")
+                    checked_at = now
+
+    cur, lat = _parse_version(APP_VERSION), _parse_version(latest)
+    if latest and cur and lat:
+        has_update = lat > cur
+    else:
+        has_update = None
+
+    return jsonify({
+        "current": APP_VERSION,
+        "latest": latest or None,
+        "latest_url": latest_url,
+        "has_update": has_update,        # True=有新版 / False=已是最新 / None=未知（没网或无缓存）
+        "checked_at": checked_at or None,
+        "releases_url": RELEASES_URL,
+    })
 
 
 @app.route("/api/logs/stats", methods=["GET"])
