@@ -1,6 +1,6 @@
 # Vibe Coding 服务转发
 
-一个基于 Flask 的多供应商 AI API 代理服务，统一对外暴露 **Anthropic Messages API**、**OpenAI Chat Completions API**、**OpenAI Responses API** 三种接口，底层可对接任意兼容的 LLM 提供商。配套 Web 管理界面，可对提供商、模型映射（含角色映射）、错误码、日志、计费、API Key、OAuth 客户端等进行可视化配置。
+一个基于 Flask 的多供应商 AI API 代理服务，统一对外暴露 **Anthropic Messages API**、**OpenAI Chat Completions API**、**OpenAI Responses API** 三种接口，底层可对接任意兼容的 LLM 提供商。配套 Web 管理界面，可对提供商、模型映射（含角色映射）、错误码、日志、计费、API Key 等进行可视化配置。
 
 ---
 [软件使用手册](manual/directions/软件使用手册.md)
@@ -22,7 +22,6 @@
 - **自动重试与容错**：请求出错或上游返回 5xx 时自动重试，连接级异常（超时、断开、Chunked 错误）全覆盖；4xx 视为客户端/上游语义错误立即返回不重试。
 - **服务降级与故障转移**：同一别名下某个上游转发失败后，会被临时"降级"一段时间，后续请求自动绕过它、切换到其他健康上游；全部上游都降级时仍会尝试使用，任一上游成功即立即恢复正常。
 - **兼容性强**：自动处理多模态降级（不支持图片的模型替换为占位符）、兼容 dashscope 风格 SSE（无空格）、自动清理 MiniMax 系列无效 `tool_use`、适配 DeepSeek 思考模式等边角情况。
-- **OAuth 2.1 支持**：实现 PKCE、动态客户端注册、JWT 访问令牌与 RFC 8414/9728 元数据端点，供 Claude Code 等支持 OAuth 登录的客户端使用。
 
 ---
 
@@ -101,24 +100,10 @@
 - 后台可生成多个 API Key，格式为 `sk-` + 48 位十六进制随机串
 - 设置名称、启用/禁用、记录最后使用时间
 - 完整 Key 仅在创建时返回一次，列表查询只显示前缀（如 `sk-xxxxxxxx...`）
-- 代理路由鉴权规则：仅 `POST` 方法需校验 API Key（或 OAuth access_token），`GET`/`PUT`/`DELETE` 到代理前缀（`/anthropic`、`/v1`、`/openai`）不需要 Key；`/mcp` 路由所有方法都需 Key 或 OAuth token；非法 Key 返回 401
+- 代理路由鉴权规则：仅 `POST` 方法需校验 API Key，`GET`/`PUT`/`DELETE` 到代理前缀（`/anthropic`、`/v1`、`/openai`）不需要 Key；非法 Key 返回 401
 - 未匹配路由（如 `GET /api/xxx`）走 Flask 默认 404；对代理前缀的 `GET` 探活请求（如 `GET /v1`）返回 `{status: ok}` 作为健康检查响应
 
-### 8. OAuth 2.1（供 Claude Code 等客户端登录）
-
-实现 OAuth 2.1 + PKCE + 动态注册 + JWT 访问令牌，符合 RFC 6749 / RFC 8414 / RFC 9728：
-
-- **PKCE**：`code_verifier` + `code_challenge`（仅支持 `S256` 方法）
-- **动态客户端注册**：`POST /oauth/register`，支持配置 `client_name`、`redirect_uris`、`grant_types`、`response_types`、`token_endpoint_auth_method`（`none` 时为 public client，不发 `client_secret`）
-- **授权端点**：`GET/POST /oauth/authorize`，授权码 10 分钟过期；未登录用户会先跳登录页，登录后自动恢复 OAuth 流程
-- **令牌端点**：`POST /oauth/token`，支持 `authorization_code`（校验 PKCE，签发 1 小时 access_token 与 30 天 refresh_token）和 `refresh_token` 两种 grant
-- **JWT 访问令牌**：采用 `alg: none` 的简化 JWT（header + payload，无签名），含 `iss` / `sub` / `scope` / `iat` / `exp` / `jti`
-- **元数据端点**：
-  - `GET /.well-known/oauth-authorization-server` — 授权服务器元数据
-  - `GET /.well-known/oauth-protected-resource/<path>` — 受保护资源元数据（RFC 9728）
-  - `GET /.well-known/jwks.json` — JWKS 端点（空实现，因 `alg=none` 无需密钥）
-
-### 9. Web 管理界面
+### 8. Web 管理界面
 
 `http://localhost:5000/`（默认），登录后包含 6 个 Tab：
 
@@ -131,7 +116,7 @@
 
 外加：自动清理设置（保留天数、清理间隔）、使用说明。
 
-### 10. 自动重试与故障转移
+### 9. 自动重试与故障转移
 
 为保证转发的高可用，系统有两层容错机制，依次生效：
 
@@ -172,7 +157,7 @@
 
 > 具体如何开启与配置，见 [四、10. 故障转移配置](#10-故障转移配置)。
 
-### 11. 兼容性与稳定性
+### 10. 兼容性与稳定性
 
 - **dashscope SSE 兼容**：正确解析 `data:{...}`（无空格）格式以统计流式 token
 - **MiniMax 系列**：自动清理 assistant 消息中 `name` 为空的 `tool_use` 块，并同步移除引用这些 id 的 `tool_result`，避免 400 报错
@@ -333,8 +318,6 @@ export ANTHROPIC_BASE_URL=http://localhost:5000/anthropic
 export ANTHROPIC_AUTH_TOKEN=sk-你的Key
 ```
 
-Claude Code 也支持通过 OAuth 登录流程接入本服务（见 [第六章 OAuth 接入](#六oauth-接入-claude-code)）。
-
 #### OpenAI 兼容客户端
 
 ```bash
@@ -439,7 +422,6 @@ ai-api-proxy/
 ├── app.py              # Flask 入口、路由、认证中间件、后台任务
 ├── config.py           # SQLite 封装、表迁移、所有数据库操作
 ├── proxy.py            # 核心代理逻辑（路由、并发、流式、角色映射、重试、多模态降级等）
-├── oauth.py            # OAuth 2.1 / PKCE / JWT 实现
 ├── requirements.txt    # 依赖
 ├── proxy.db            # SQLite 数据库（自动创建，已 gitignore）
 ├── templates/
@@ -450,24 +432,9 @@ ai-api-proxy/
 
 ---
 
-## 六、OAuth 接入 Claude Code
-
-Claude Code 支持 OAuth 登录流程。本服务实现的 OAuth 2.1 端点可供其作为授权服务器使用：
-
-1. **客户端注册**：Claude Code 启动时会通过 `POST /oauth/register` 动态注册客户端（`token_endpoint_auth_method=none`，public client）。
-2. **授权码 + PKCE**：客户端携带 `code_verifier` / `code_challenge` 跳转 `GET /oauth/authorize`；若用户未登录，先跳登录页，登录后自动回到授权流程并下发授权码。
-3. **换取令牌**：客户端用授权码 + `code_verifier` 调用 `POST /oauth/token` 换取 access_token（1 小时）与 refresh_token（30 天）。
-4. **访问代理**：客户端携带 `Authorization: Bearer <access_token>` 访问受保护资源。
-
-元数据可通过 `GET /.well-known/oauth-authorization-server` 获取。
-
-> 说明：本服务历史版本曾提供 MCP 图片理解功能与 `/mcp` 路由，现已移除；当前 `/mcp` 仅保留认证中间件的防御性逻辑，OAuth 端点主要用于 Claude Code 的登录接入。
-
----
-
-## 七、注意事项
+## 六、注意事项
 
 1. **SQLite 表结构变更**：修改 SQLite 表结构时，必须先备份表内现有数据，再删除旧表重建，避免直接 `DROP TABLE` 导致历史数据永久丢失。
 2. **API Key 安全**：管理员密码与 API Key 均以哈希 / 随机串形式存于 SQLite，请妥善保管 `proxy.db`。未配置 `proxy.ini` 时内置默认管理员为 `admin / admin123`，**首启即存在弱口令**，请通过 `proxy.ini` 的 `[admin]` 段修改后重启（仅修改数据库中的密码哈希会在下次启动时被 `proxy.ini` 覆盖回 `admin123`）。
-3. **生产部署**：建议关闭 `debug=True`，配合反向代理（Nginx/Caddy）并启用 HTTPS。OAuth 的 access_token 采用 `alg: none` 的简化 JWT，仅适合内网 / 受信环境，公网部署请评估风险。
+3. **生产部署**：建议关闭 `debug=True`，配合反向代理（Nginx/Caddy）并启用 HTTPS，公网部署务必启用 HTTPS 以保护 API Key 和管理后台凭据。
 4. **数据库维护**：数据库体积会自动维护（后台每天清理碎片）；通常无需手动处理。如确需手动压缩，可在低峰期用 SQLite 工具对 `proxy.db` 做一次压缩操作。

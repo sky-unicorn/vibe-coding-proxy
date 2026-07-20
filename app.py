@@ -1,13 +1,10 @@
 import json
-import secrets
 import sys
 import threading
 import time as _time
-import urllib.parse
 from flask import Flask, request, jsonify, Response, render_template, session, redirect, url_for
 import config
 import proxy
-import oauth
 from version import APP_VERSION, RELEASES_URL, GITHUB_LATEST_API
 
 # Windows 控制台默认用 GBK 编码，直接 print 中文会乱码；强制 stdout/stderr 用 UTF-8。
@@ -33,7 +30,7 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 # ---- 认证中间件 ----
 
 # 不需要登录就能访问的路由前缀
-_PUBLIC_PREFIXES = ("/anthropic", "/v1", "/openai", "/oauth", "/.well-known")
+_PUBLIC_PREFIXES = ("/anthropic", "/v1", "/openai")
 # 登录相关路由
 _AUTH_ROUTES = ("/api/auth/login",)
 
@@ -70,8 +67,7 @@ def _check_api_key():
     path = request.path
 
     # 代理路由：非POST不需要API Key
-    # MCP 路由：所有请求（包括 GET SSE）都需要 API Key
-    if not path.startswith("/mcp") and request.method != "POST":
+    if request.method != "POST":
         return None
 
     # 从请求头提取API Key
@@ -93,40 +89,6 @@ def _check_api_key():
             api_key = auth[7:]
         if not config.validate_api_key(api_key):
             return jsonify({"error": "无效的 API Key"}), 401
-    elif path.startswith("/mcp"):
-        # MCP: 优先 OAuth Bearer token，其次 API Key
-        auth = request.headers.get("Authorization", "")
-        if auth.startswith("Bearer "):
-            token = auth[7:]
-            # 尝试作为 OAuth access_token 验证
-            payload = oauth.validate_access_token(token)
-            if payload:
-                return None
-            # 否则尝试作为 API Key 验证
-            if config.validate_api_key(token):
-                return None
-            # 两者都失败，返回带 WWW-Authenticate 头的 401
-            base = request.host_url.rstrip("/")
-            return Response(
-                json.dumps({"error": {"message": "无效的认证凭证", "type": "authentication_error", "code": "invalid_token"}}),
-                status=401,
-                mimetype="application/json",
-                headers={
-                    "WWW-Authenticate": f'Bearer resource_metadata="{base}/.well-known/oauth-protected-resource/mcp", scope="mcp:read mcp:write"'
-                }
-            )
-        # 无 Bearer token，尝试 x-api-key
-        api_key = request.headers.get("x-api-key", "")
-        if api_key and config.validate_api_key(api_key):
-            return None
-        return Response(
-            json.dumps({"error": {"message": "需要认证", "type": "authentication_error", "code": "missing_token"}}),
-            status=401,
-            mimetype="application/json",
-            headers={
-                "WWW-Authenticate": f'Bearer resource_metadata="{request.host_url.rstrip("/")}/.well-known/oauth-protected-resource/mcp", scope="mcp:read mcp:write"'
-            }
-        )
 
 
 # ---- Web UI ----
@@ -151,19 +113,6 @@ def api_login():
     user = config.verify_admin_login(username, password)
     if user:
         session["admin_user"] = user
-        # 检查是否有待完成的 OAuth 授权请求
-        oauth_next = session.pop("oauth_next", None)
-        if oauth_next:
-            # 从 session 恢复 OAuth 参数并重定向到授权端点
-            params = [("response_type", "code"), ("client_id", oauth_next.get("client_id", "")),
-                      ("redirect_uri", oauth_next.get("redirect_uri", "")),
-                      ("code_challenge", oauth_next.get("code_challenge", "")),
-                      ("code_challenge_method", oauth_next.get("code_challenge_method", "S256")),
-                      ("state", oauth_next.get("state", "")),
-                      ("resource", oauth_next.get("resource", "")),
-                      ("scope", oauth_next.get("scope", ""))]
-            qs = urllib.parse.urlencode({k: v for k, v in params if v})
-            return redirect("/oauth/authorize?" + qs)
         return jsonify({"ok": True, "username": user["username"]})
     return jsonify({"error": "用户名或密码错误"}), 401
 
@@ -708,213 +657,6 @@ def api_billing_overview():
 @app.route("/api/concurrency", methods=["GET"])
 def api_concurrency_status():
     return jsonify(proxy.get_concurrency_status())
-
-
-# ---- OAuth 2.1 端点 (RFC 8414 / RFC 9728) ----
-
-@app.route("/.well-known/oauth-protected-resource", methods=["GET"], defaults={"path": ""})
-@app.route("/.well-known/oauth-protected-resource/<path:path>", methods=["GET"])
-def oauth_protected_resource(path):
-    """Protected Resource Metadata (RFC 9728)"""
-    resource_path = "/" + path if path else "/"
-    return jsonify(oauth.get_oauth_protected_resource_metadata(resource_path))
-
-
-@app.route("/.well-known/oauth-authorization-server", methods=["GET"])
-def oauth_authorization_server_metadata():
-    """Authorization Server Metadata (RFC 8414)"""
-    return jsonify(oauth.get_oauth_authorization_server_metadata())
-
-
-@app.route("/.well-known/jwks.json", methods=["GET"])
-def oauth_jwks():
-    """JWKS 端点 (空实现，alg=none 不需要密钥)"""
-    return jsonify({"keys": []})
-
-
-# ---- OAuth 动态客户端注册 (RFC 7591) ----
-
-@app.route("/oauth/register", methods=["POST"])
-def oauth_register():
-    """动态注册 OAuth 客户端"""
-    try:
-        data = request.get_json(force=True)
-    except Exception:
-        return jsonify({"error": "invalid_request", "error_description": "无效的 JSON"}), 400
-
-    client_name = data.get("client_name", "Claude Code")
-    redirect_uris = data.get("redirect_uris", [])
-    grant_types = data.get("grant_types", ["authorization_code", "refresh_token"])
-    response_types = data.get("response_types", ["code"])
-    token_endpoint_auth_method = data.get("token_endpoint_auth_method", "none")
-    application_type = data.get("application_type", "native")
-
-    if not redirect_uris:
-        return jsonify({"error": "invalid_request", "error_description": "redirect_uris 是必填项"}), 400
-
-    # 检查是否支持 PKCE (必须 S256)
-    if token_endpoint_auth_method == "none":
-        # 允许 public client
-        pass
-
-    client_id, client_secret = oauth.register_oauth_client(
-        application_type=application_type,
-        client_name=client_name,
-        redirect_uris=redirect_uris,
-        grant_types=grant_types,
-        response_types=response_types,
-        token_endpoint_auth_method=token_endpoint_auth_method,
-    )
-
-    resp = {
-        "client_id": client_id,
-        "client_id_issued_at": int(_time.time()),
-        "grant_types": grant_types,
-        "redirect_uris": redirect_uris,
-        "response_types": response_types,
-    }
-    if client_secret:
-        resp["client_secret"] = client_secret
-    return jsonify(resp), 201
-
-
-# ---- OAuth 授权端点 ----
-
-@app.route("/oauth/authorize", methods=["GET", "POST"])
-def oauth_authorize():
-    """OAuth 2.1 授权端点 (Authorization Code + PKCE)"""
-    # 如果未登录，重定向到登录页面
-    if not session.get("admin_user"):
-        # 保存原始请求参数到 session
-        session["oauth_next"] = {
-            "response_type": request.args.get("response_type", "code"),
-            "client_id": request.args.get("client_id", ""),
-            "redirect_uri": request.args.get("redirect_uri", ""),
-            "code_challenge": request.args.get("code_challenge", ""),
-            "code_challenge_method": request.args.get("code_challenge_method", ""),
-            "state": request.args.get("state", ""),
-            "resource": request.args.get("resource", ""),
-            "scope": request.args.get("scope", ""),
-        }
-        return redirect("/login?next=" + request.path)
-
-    if request.method == "GET":
-        # 显示授权确认页面（简化处理：自动批准）
-        client_id = request.args.get("client_id", "")
-        redirect_uri = request.args.get("redirect_uri", "")
-        scope = request.args.get("scope", "")
-        state = request.args.get("state", "")
-        resource = request.args.get("resource", "")
-        code_challenge = request.args.get("code_challenge", "")
-
-        # 简化处理：自动授权（用户已登录即视为已授权）
-        code = secrets.token_urlsafe(32)
-        oauth.create_authorization_code(
-            client_id=client_id,
-            code=code,
-            redirect_uri=redirect_uri,
-            scope=scope,
-            code_challenge=code_challenge,
-            user_id=1,
-            resource=resource,
-        )
-        params = {"code": code}
-        if state:
-            params["state"] = state
-        if redirect_uri:
-            return redirect(redirect_uri + "?" + urllib.parse.urlencode(params))
-        else:
-            return jsonify({"code": code, "state": state})
-
-    # POST: 处理表单提交（授权确认）
-    data = request.form
-    client_id = data.get("client_id", "")
-    redirect_uri = data.get("redirect_uri", "")
-    scope = data.get("scope", "")
-    state = data.get("state", "")
-    resource = data.get("resource", "")
-    code_challenge = data.get("code_challenge", "")
-
-    # 简化处理：自动授权
-    code = secrets.token_urlsafe(32)
-    oauth.create_authorization_code(
-        client_id=client_id,
-        code=code,
-        redirect_uri=redirect_uri,
-        scope=scope,
-        code_challenge=code_challenge,
-        user_id=1,
-        resource=resource,
-    )
-
-    params = {"code": code}
-    if state:
-        params["state"] = state
-    if redirect_uri:
-        return redirect(redirect_uri + "?" + urllib.parse.urlencode(params))
-    else:
-        return jsonify({"code": code, "state": state})
-
-
-# ---- OAuth 令牌端点 ----
-
-@app.route("/oauth/token", methods=["POST"])
-def oauth_token():
-    """OAuth 2.1 令牌端点"""
-    data = request.form if request.form else request.get_json(force=True)
-    grant_type = data.get("grant_type", "")
-
-    client_id = data.get("client_id", "")
-    redirect_uri = data.get("redirect_uri", "")
-    resource = data.get("resource", "")
-
-    if grant_type == "authorization_code":
-        code = data.get("code", "")
-        code_verifier = data.get("code_verifier", "")
-
-        # 验证授权码
-        code_info = oauth.consume_authorization_code(code, client_id)
-        if not code_info:
-            return jsonify({"error": "invalid_grant", "error_description": "授权码无效或已过期"}), 400
-
-        # 验证 PKCE: code_verifier 的 SHA256 摘要应与存储的 code_challenge 匹配
-        saved_challenge = code_info.get("code_verifier", "")
-        if saved_challenge and oauth.generate_code_challenge(code_verifier) != saved_challenge:
-            return jsonify({"error": "invalid_grant", "error_description": "PKCE 验证失败"}), 400
-
-        # 创建访问令牌
-        access_token, refresh_token = oauth.create_token(
-            client_id=client_id,
-            scope=code_info.get("scope", ""),
-            user_id=code_info.get("user_id"),
-        )
-        return jsonify({
-            "access_token": access_token,
-            "token_type": "Bearer",
-            "expires_in": 3600,
-            "refresh_token": refresh_token,
-            "scope": code_info.get("scope", ""),
-        })
-
-    elif grant_type == "refresh_token":
-        refresh_token_val = data.get("refresh_token", "")
-        if not refresh_token_val:
-            return jsonify({"error": "invalid_request", "error_description": "缺少 refresh_token"}), 400
-
-        result = oauth.refresh_access_token(refresh_token_val, client_id)
-        if not result:
-            return jsonify({"error": "invalid_grant", "error_description": "refresh_token 无效或已过期"}), 400
-
-        access_token, new_refresh_token = result
-        return jsonify({
-            "access_token": access_token,
-            "token_type": "Bearer",
-            "expires_in": 3600,
-            "refresh_token": new_refresh_token,
-        })
-
-    else:
-        return jsonify({"error": "unsupported_grant_type", "error_description": f"不支持的 grant_type: {grant_type}"}), 400
 
 
 # ---- 后台自动清理线程 ----

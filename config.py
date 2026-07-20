@@ -1026,6 +1026,58 @@ def _migrate_reconcile_disabled_provider_mappings(conn):
     conn.commit()
 
 
+def _migrate_oauth_tokens_access_token_unique(conn):
+    """v7->v8：oauth_tokens.access_token 新增命名唯一索引，堵 alg=none JWT 伪造（BE-02）。
+
+    背景：原 access_token 为 alg=none JWT，validate_access_token 仅 base64 解码查 exp、
+    不查库，任何掌握 client_id 的客户端都能伪造令牌绕过 /mcp 的 API Key 校验。修复后
+    access_token 改为不透明随机串，validate_access_token 强制查 oauth_tokens 表。查表
+    需在 access_token 上建索引避免全表扫描，且唯一索引可防止历史 JWT 生成路径在极端
+    时序下（同一秒同一 client_id+scope，jti 仍不同故实际不冲突）产生的潜在重复。
+
+    用命名显式唯一索引 idx_oauth_tokens_access_token，不用列级 UNIQUE 约束：
+      _self_check_schema 排除 sqlite_autoindex_*，列级 UNIQUE 在老库上无法被自检兜底；
+      命名显式索引可被自检与 _calibrate_user_version 特征检测可靠捕获（查 sqlite_master）。
+
+    幂等保证：
+      - sqlite_master 查索引名做存在性守卫，已存在则直接 return；
+      - 建索引前清理潜在重复 access_token（保留每组 id 最大者），否则 CREATE UNIQUE INDEX
+        会抛 IntegrityError；历史 alg=none JWT 因含 uuid4 jti 实际不会重复，清理仅作防御。
+    不改表结构（列定义不变），仅加索引，无需 backup-drop-recreate。
+    """
+    existing = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_oauth_tokens_access_token'"
+    ).fetchone()
+    if existing:
+        return  # 幂等：索引已存在则跳过
+
+    # 防御性去重：保留每组 access_token 的 id 最大者，删除旧重复行（token 可经 refresh 重新获取）
+    conn.execute(
+        "DELETE FROM oauth_tokens "
+        "WHERE id NOT IN (SELECT MAX(id) FROM oauth_tokens GROUP BY access_token)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX idx_oauth_tokens_access_token ON oauth_tokens(access_token)"
+    )
+    conn.commit()
+
+
+def _migrate_drop_oauth_tables(conn):
+    """v8->v9：删除 OAuth 相关三张表（oauth_clients / oauth_codes / oauth_tokens）。
+
+    背景：OAuth 功能自项目初始化起随脚手架带入，但从未被实际使用（三表均为空行），
+    /mcp 路由已无处理函数（历史 MCP 图片理解功能已移除），前端管理界面无 OAuth 入口。
+    保留这些代码带来一整批安全缺陷（BE-02 alg=none 伪造、BE-05 撞名注册、BE-07 授权码
+    不校验 redirect_uri、BE-10 refresh 不轮换等），删除后攻击面归零。
+
+    幂等保证：DROP TABLE IF EXISTS 对不存在的表是空操作。
+    """
+    conn.execute("DROP TABLE IF EXISTS oauth_clients")
+    conn.execute("DROP TABLE IF EXISTS oauth_codes")
+    conn.execute("DROP TABLE IF EXISTS oauth_tokens")
+    conn.commit()
+
+
 def _create_latest_schema(conn):
     """用最新 schema 创建所有表（CREATE TABLE IF NOT EXISTS）。
 
@@ -1156,44 +1208,6 @@ def _create_latest_schema(conn):
             UNIQUE (provider_id, window_type, window_start),
             FOREIGN KEY (provider_id) REFERENCES providers(id)
         );
-
-        CREATE TABLE IF NOT EXISTS oauth_clients (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            client_id TEXT NOT NULL UNIQUE,
-            client_name TEXT NOT NULL,
-            client_secret TEXT DEFAULT NULL,
-            application_type TEXT NOT NULL DEFAULT 'native',
-            redirect_uris TEXT NOT NULL DEFAULT '[]',
-            grant_types TEXT NOT NULL DEFAULT '["authorization_code","refresh_token"]',
-            response_types TEXT NOT NULL DEFAULT '["code"]',
-            token_endpoint_auth_method TEXT NOT NULL DEFAULT 'none',
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS oauth_codes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT NOT NULL UNIQUE,
-            client_id TEXT NOT NULL,
-            redirect_uri TEXT NOT NULL,
-            scope TEXT DEFAULT '',
-            code_verifier TEXT NOT NULL,
-            user_id INTEGER DEFAULT NULL,
-            resource TEXT DEFAULT '',
-            expires_at TEXT NOT NULL,
-            used INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS oauth_tokens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            client_id TEXT NOT NULL,
-            access_token TEXT NOT NULL,
-            access_token_expires_at TEXT NOT NULL,
-            refresh_token TEXT NOT NULL,
-            refresh_token_expires_at TEXT NOT NULL,
-            scope TEXT DEFAULT '',
-            user_id INTEGER DEFAULT NULL,
-            created_at TEXT NOT NULL
-        );
     """)
     conn.commit()
 
@@ -1291,6 +1305,16 @@ _MIGRATIONS = [
         7,
         "修正 provider 禁用但其下 mapping 仍启用的历史假启用数据",
         _migrate_reconcile_disabled_provider_mappings,
+    ),
+    (
+        8,
+        "oauth_tokens.access_token 加命名唯一索引，堵 alg=none JWT 伪造认证绕过（BE-02）",
+        _migrate_oauth_tokens_access_token_unique,
+    ),
+    (
+        9,
+        "删除 OAuth 相关三张表（oauth_clients/oauth_codes/oauth_tokens），攻击面归零",
+        _migrate_drop_oauth_tables,
     ),
 ]
 
@@ -1409,6 +1433,18 @@ def _calibrate_user_version(conn):
     ).fetchone()
     if v7_done:
         detected = 7  # v7 标记键存在；v7 隐含 v6/v5/v4/v3/v2/v1
+    # v8 标志：oauth_tokens.access_token 命名唯一索引（查 sqlite_master，不用 PRAGMA table_info）
+    v8_idx = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_oauth_tokens_access_token'"
+    ).fetchone()
+    if v8_idx:
+        detected = 8  # v8 索引存在；v8 隐含 v7/v6/v5/v4/v3/v2/v1
+    # v9 标志：oauth_tokens 表已不存在（删表类迁移，用 sqlite_master 检测表存在性）
+    v9_gone = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='oauth_tokens'"
+    ).fetchone()
+    if not v9_gone:
+        detected = 9  # oauth_tokens 表已删除；v9 隐含 v8/v7/v6/v5/v4/v3/v2/v1
     current = conn.execute("PRAGMA user_version").fetchone()[0]
     if detected > current:
         conn.execute(f"PRAGMA user_version = {detected}")
