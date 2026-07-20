@@ -157,6 +157,19 @@ tr[data-alias]{background:rgba(var(--alias-rgb),.07)}
 tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
 .alias-badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:500;background:rgba(var(--alias-rgb),.2);color:rgb(var(--alias-rgb));gap:6px}
 .alias-color-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:rgb(var(--alias-rgb));flex-shrink:0}
+/* 功能提示框（居中浮层） */
+.feature-toast{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:var(--card);border:1px solid var(--border);border-radius:12px;padding:24px 28px;width:440px;max-width:90vw;z-index:200;box-shadow:0 8px 32px rgba(0,0,0,.5);animation:toastFadeIn .25s ease}
+.feature-toast.closing{animation:toastFadeOut .2s ease forwards}
+@keyframes toastFadeIn{from{opacity:0;transform:translate(-50%,-50%) scale(.95)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}
+@keyframes toastFadeOut{from{opacity:1;transform:translate(-50%,-50%) scale(1)}to{opacity:0;transform:translate(-50%,-50%) scale(.95)}}
+.feature-toast-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.feature-toast-header h4{font-size:15px;font-weight:600;margin:0}
+.feature-toast-close{background:none;border:none;color:var(--text2);cursor:pointer;font-size:18px;line-height:1;padding:2px 6px;border-radius:4px;transition:color .15s,background .15s}
+.feature-toast-close:hover{color:var(--text);background:rgba(255,255,255,.08)}
+.feature-toast-body{font-size:13px;line-height:1.7;color:var(--text2)}
+.feature-toast-body strong{color:var(--text)}
+.feature-toast-timer{height:3px;background:var(--border);border-radius:2px;margin-top:16px;overflow:hidden}
+.feature-toast-timer-bar{height:100%;background:var(--primary);border-radius:2px;width:100%;transition:width linear}
 </style>
 </head>
 <body>
@@ -205,7 +218,7 @@ tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
         <h2>模型映射</h2>
         <button class="btn btn-primary" onclick="openModelModal()">添加映射</button>
       </div>
-      <p style="font-size:13px;color:var(--text2);margin-bottom:12px">将请求中的模型名映射到实际的模型和提供商。同一别名可配置多条映射，系统会按优先级加权轮询，并自动选并发最低的提供商。开启严格优先级后，仅在当前最高优先级层内选择，整层降级才下放到更低优先级层。</p>
+      <p style="font-size:13px;color:var(--text2);margin-bottom:12px">将请求中的模型名（别名）映射到实际的模型和提供商。同一别名可配置多条映射，系统按优先级加权轮询，并自动选并发最低的提供商。</p>
       <div class="degradation-bar">
         <div class="item">
           <label class="toggle"><input type="checkbox" id="degradation-enabled"><span class="toggle-slider"></span></label>
@@ -804,9 +817,46 @@ async function saveDegradationSettings(){
     refreshDegradation();
   }catch(e){alert('保存失败');}
 }
+// 功能提示框：开关打开时弹出说明，2秒自动关闭，关闭不改变开关状态
+let _featureToastTimer=null;
+function showFeatureToast(title,bodyHtml){
+  // 移除已有的提示框
+  const old=document.getElementById('feature-toast');
+  if(old) old.remove();
+  if(_featureToastTimer){clearTimeout(_featureToastTimer);_featureToastTimer=null;}
+  const toast=document.createElement('div');
+  toast.id='feature-toast';
+  toast.className='feature-toast';
+  toast.innerHTML=`<div class="feature-toast-header"><h4>${title}</h4><button class="feature-toast-close" onclick="closeFeatureToast()">&times;</button></div><div class="feature-toast-body">${bodyHtml}</div><div class="feature-toast-timer"><div class="feature-toast-timer-bar" id="feature-toast-bar"></div></div>`;
+  document.body.appendChild(toast);
+  // 进度条动画
+  requestAnimationFrame(()=>{
+    const bar=document.getElementById('feature-toast-bar');
+    if(bar){bar.style.transitionDuration='2s';bar.style.width='0%';}
+  });
+  // 2秒后自动关闭
+  _featureToastTimer=setTimeout(()=>closeFeatureToast(),2000);
+}
+function closeFeatureToast(){
+  const toast=document.getElementById('feature-toast');
+  if(!toast) return;
+  if(_featureToastTimer){clearTimeout(_featureToastTimer);_featureToastTimer=null;}
+  toast.classList.add('closing');
+  setTimeout(()=>{const t=document.getElementById('feature-toast');if(t)t.remove();},200);
+}
 document.getElementById('degradation-enabled').addEventListener('change',function(){
   document.getElementById('degradation-strict').disabled=!this.checked;
   if(!this.checked){document.getElementById('degradation-strict').checked=false;}
+  else{
+    showFeatureToast('启用服务降级',
+      '开启后，当某个模型映射对应的提供商持续返回错误（如 429 限流、5xx）时，系统会自动将该映射临时标记为<strong>降级</strong>状态，并在设定的<strong>降级持续秒数</strong>内跳过它、优先调用同一别名下的其他提供商，避免反复打到坏掉的上游。<br><br><strong>适用场景</strong>：同一别名配置了多个提供商做负载均衡，希望某个上游出故障时自动切到其他可用上游，而不是逐个失败重试。若每个别名只有一个提供商，开启降级意义不大。');
+  }
+});
+document.getElementById('degradation-strict').addEventListener('change',function(){
+  if(this.checked){
+    showFeatureToast('严格优先级（逐级下放）',
+      '关闭（默认）时，系统在同一别名的<strong>所有优先级层</strong>之间<strong>加权轮询</strong>——优先级高的层获得更多流量，但低优先级层也会被使用。<br><br>开启<strong>严格优先级</strong>后，系统<strong>仅在当前可用的最高优先级层</strong>内选择；只有当整个高优先级层都已降级（全部提供商故障）时，才会<strong>逐级下放</strong>到下一优先级层。<br><br><strong>适用场景</strong>：希望主力模型优先用满、省钱模型只在主力全部不可用时才兜底；或不同优先级对应不同价位/质量，希望严格按层级使用，不愿低优先级分走流量。');
+  }
 });
 async function refreshDegradation(){
   try{
@@ -1169,7 +1219,15 @@ async function saveError(){
 }
 async function delError(id){if(!confirm('确定删除？'))return;await fetch(API+'/api/error-mappings/'+id,{method:'DELETE'});loadErrors();}
 
-async function toggleProvider(id,enabled){await fetch(API+'/api/providers/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});loadProviders()}
+async function toggleProvider(id,enabled){
+  await fetch(API+'/api/providers/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
+  // 后端会级联更新该 provider 下所有 model_mappings 的 enabled，故同时刷新模型列表以保持 UI 与 DB 一致
+  loadProviders();
+  loadModels();
+  showFeatureToast(enabled?'已启用提供商':'已停用提供商', enabled
+    ? '该提供商下所有映射模型已同步置为<strong>启用</strong>。'
+    : '该提供商下所有映射模型已同步置为<strong>停用</strong>。');
+}
 async function toggleModel(id,enabled){await fetch(API+'/api/models/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});loadModels()}
 async function toggleError(id,enabled){await fetch(API+'/api/error-mappings/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});loadErrors()}
 

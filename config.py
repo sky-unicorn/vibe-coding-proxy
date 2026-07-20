@@ -895,6 +895,105 @@ def _migrate_model_mappings_add_native_responses(conn):
         raise RuntimeError(f"model_mappings 迁移后悬空 provider_id 数量变化：{dangling_before} -> {dangling_after}")
 
 
+def _migrate_model_mappings_add_disable_reason(conn):
+    """v5->v6：model_mappings 表新增 disable_reason 列，与 providers.disable_reason 对齐。
+
+    用途：区分 mapping 的禁用来源。
+      ''                    —— 未禁用（或联动启用后归位）
+      'manual'              —— 用户在 UI 上手动禁用该 mapping（toggleModel）
+      'provider_disabled'   —— 因所属 provider 被禁用而联动禁用（级联）
+
+    联动逻辑：
+      provider 禁用 → 只把当前 enabled=1 的 mapping 标记为 'provider_disabled' 并禁用
+                      （已 'manual' 的不动，避免把用户手动禁用改写成联动禁用）
+      provider 启用 → 只恢复 'provider_disabled' 的 mapping（保留 'manual' 的禁用状态）
+
+    回填策略（严格按 SQLite Migration Rule：备份 -> DROP -> CREATE(新结构) -> 回填 -> 重建索引 -> 完整性校验）：
+      历史 enabled=1 的行 → disable_reason=''（未禁用）
+      历史 enabled=0 的行 → disable_reason='manual'（历史禁用一律视为用户手动禁用，
+                          因为 v6 之前从无 provider 级联逻辑，所有禁用都是用户自己设的）
+    """
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(model_mappings)").fetchall()]
+    if "disable_reason" in cols:
+        return  # 幂等：列已存在则跳过
+
+    # 1. 备份
+    mm_count_before = conn.execute("SELECT COUNT(*) FROM model_mappings").fetchone()[0]
+    old_rows = conn.execute("SELECT * FROM model_mappings").fetchall()
+    old_col_names = [d[0] for d in conn.execute("SELECT * FROM model_mappings LIMIT 0").description]
+    dangling_before = conn.execute(
+        "SELECT COUNT(*) FROM model_mappings WHERE provider_id NOT IN (SELECT id FROM providers)"
+    ).fetchone()[0]
+
+    # 2. DROP
+    conn.execute("DROP TABLE model_mappings")
+
+    # 3. CREATE（带新列）
+    conn.execute("""
+        CREATE TABLE model_mappings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alias TEXT NOT NULL,
+            target_model TEXT NOT NULL,
+            provider_id INTEGER NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 1,
+            model_type TEXT NOT NULL DEFAULT 'text',
+            max_tokens INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            role_mappings TEXT NOT NULL DEFAULT '[]',
+            reasoning_effort_supported INTEGER NOT NULL DEFAULT 1,
+            think_injection INTEGER NOT NULL DEFAULT 0,
+            reasoning_content_field INTEGER NOT NULL DEFAULT 1,
+            native_responses INTEGER NOT NULL DEFAULT 0,
+            disable_reason TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY (provider_id) REFERENCES providers(id)
+        )
+    """)
+
+    # 4. 重建索引
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_model_mappings_alias_enabled "
+        "ON model_mappings(alias, enabled)"
+    )
+
+    # 5. 回填
+    for row in old_rows:
+        rd = dict(zip(old_col_names, row))
+        old_enabled = int(rd.get("enabled", 1))
+        # 历史 enabled=0 视为用户手动禁用；enabled=1 视为未禁用
+        disable_reason = "manual" if old_enabled == 0 else ""
+        conn.execute(
+            "INSERT INTO model_mappings (id, alias, target_model, provider_id, priority, "
+            "model_type, max_tokens, enabled, role_mappings, reasoning_effort_supported, "
+            "think_injection, reasoning_content_field, native_responses, disable_reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                rd["id"], rd["alias"], rd["target_model"], rd["provider_id"],
+                int(rd.get("priority") or 1), rd.get("model_type") or "text",
+                int(rd.get("max_tokens") or 0), old_enabled,
+                rd.get("role_mappings") or "[]",
+                int(rd.get("reasoning_effort_supported", 1)),
+                int(rd.get("think_injection", 0)),
+                int(rd.get("reasoning_content_field", 1)),
+                int(rd.get("native_responses", 0)),
+                disable_reason,
+            ),
+        )
+    conn.commit()
+
+    # 6. 完整性校验
+    mm_count_after = conn.execute("SELECT COUNT(*) FROM model_mappings").fetchone()[0]
+    if mm_count_after != mm_count_before:
+        raise RuntimeError(f"model_mappings 迁移后行数不一致：{mm_count_before} -> {mm_count_after}")
+    dangling_after = conn.execute(
+        "SELECT COUNT(*) FROM model_mappings WHERE provider_id NOT IN (SELECT id FROM providers)"
+    ).fetchone()[0]
+    if dangling_after != dangling_before:
+        raise RuntimeError(f"model_mappings 迁移后悬空 provider_id 数量变化：{dangling_before} -> {dangling_after}")
+    empty_alias = conn.execute("SELECT COUNT(*) FROM model_mappings WHERE alias IS NULL OR alias = ''").fetchone()[0]
+    if empty_alias != 0:
+        raise RuntimeError(f"model_mappings 迁移后存在 {empty_alias} 行空 alias")
+
+
 def _create_latest_schema(conn):
     """用最新 schema 创建所有表（CREATE TABLE IF NOT EXISTS）。
 
@@ -931,6 +1030,7 @@ def _create_latest_schema(conn):
             think_injection INTEGER NOT NULL DEFAULT 0,
             reasoning_content_field INTEGER NOT NULL DEFAULT 1,
             native_responses INTEGER NOT NULL DEFAULT 0,
+            disable_reason TEXT NOT NULL DEFAULT '',
             FOREIGN KEY (provider_id) REFERENCES providers(id)
         );
 
@@ -1150,6 +1250,11 @@ _MIGRATIONS = [
         "添加模型映射原生 Responses 透传开关：model_mappings 表新增 native_responses 列",
         _migrate_model_mappings_add_native_responses,
     ),
+    (
+        6,
+        "model_mappings 新增 disable_reason 列以区分手动禁用与 provider 联动禁用",
+        _migrate_model_mappings_add_disable_reason,
+    ),
 ]
 
 CURRENT_SCHEMA_VERSION = len(_MIGRATIONS)
@@ -1258,6 +1363,8 @@ def _calibrate_user_version(conn):
         detected = 4  # v4 标志列存在；v4 隐含 v3/v2/v1
     if "native_responses" in cols_mm:
         detected = 5  # v5 标志列存在；v5 隐含 v4/v3/v2/v1
+    if "disable_reason" in cols_mm:
+        detected = 6  # v6 标志列存在；v6 隐含 v5/v4/v3/v2/v1
     current = conn.execute("PRAGMA user_version").fetchone()[0]
     if detected > current:
         conn.execute(f"PRAGMA user_version = {detected}")
@@ -1391,6 +1498,38 @@ def add_provider(name, anthropic_url="", openai_url="", api_key="", enabled=True
     return provider_id
 
 
+def _cascade_provider_enabled_to_mappings(conn, provider_id, new_enabled):
+    """级联同步 provider 的 enabled 状态到其下所有 model_mappings，区分联动禁用与手动禁用。
+
+    传入的 conn 必须与 provider 的 UPDATE 在同一连接/事务内（保证原子性）。
+    本函数不读取 provider 当前 enabled（时序敏感：调用方可能在 UPDATE providers 之前或
+    之后调用），是否真的需要级联（新旧 enabled 是否不同）由调用方负责判断：
+      - update_provider 在 UPDATE 之前比较新旧值，仅变化时调用
+      - reset_expired_windows_and_reenable 查的是 enabled=0 的 provider 并要改成 1，
+        本身保证有变化，无需额外判断
+
+    语义：
+    - new_enabled=0（禁用 provider）：把该 provider 下所有 enabled=1 的 mapping 改为
+      enabled=0 且 disable_reason='provider_disabled'；不动已经禁用的 mapping（保留其
+      原 disable_reason，如 'manual'），避免覆盖用户手动禁用的标记。
+    - new_enabled=1（启用 provider）：只恢复 disable_reason='provider_disabled' 的 mapping
+      为 enabled=1 且 disable_reason=''；不动 disable_reason='manual' 的 mapping，
+      保留用户的手动禁用状态。
+    """
+    if int(new_enabled) == 0:
+        conn.execute(
+            "UPDATE model_mappings SET enabled = 0, disable_reason = 'provider_disabled' "
+            "WHERE provider_id = ? AND enabled = 1",
+            (provider_id,),
+        )
+    else:
+        conn.execute(
+            "UPDATE model_mappings SET enabled = 1, disable_reason = '' "
+            "WHERE provider_id = ? AND disable_reason = 'provider_disabled'",
+            (provider_id,),
+        )
+
+
 def update_provider(provider_id, **kwargs):
     allowed = {"name", "anthropic_url", "openai_url", "api_key", "enabled", "max_concurrency", "disable_reason", "full_path"}
     fields = []
@@ -1399,7 +1538,8 @@ def update_provider(provider_id, **kwargs):
         if k in allowed:
             fields.append(f"{k} = ?")
             values.append(int(v) if k in ("enabled", "max_concurrency", "full_path") else v)
-    # 手动启用时，清除 disable_reason；手动禁用时，标记为 manual
+    # 手动启用时，清除 disable_reason；手动禁用时，标记为 manual。
+    # 若调用方显式传了 disable_reason（即使是空串），则尊重调用方值，不自动覆盖。
     if "enabled" in kwargs:
         if kwargs["enabled"]:
             if "disable_reason" not in kwargs:
@@ -1413,6 +1553,14 @@ def update_provider(provider_id, **kwargs):
         return
     values.append(provider_id)
     conn = get_conn()
+    # 级联更新：仅当 enabled 真正变化时，同步该 provider 下所有 model_mappings。
+    # 必须在 UPDATE providers 之前调用——此时 provider 的 enabled 仍是旧值，
+    # 可据此判断是否真有变化；级联函数本身不做无变化检测（时序敏感）。
+    if "enabled" in kwargs:
+        new_enabled = int(kwargs["enabled"])
+        old = conn.execute("SELECT enabled FROM providers WHERE id = ?", (provider_id,)).fetchone()
+        if old and old["enabled"] != new_enabled:
+            _cascade_provider_enabled_to_mappings(conn, provider_id, new_enabled)
     conn.execute(f"UPDATE providers SET {', '.join(fields)} WHERE id = ?", values)
     conn.commit()
     conn.close()
@@ -1465,9 +1613,12 @@ def add_model_mapping(alias, target_model, provider_id, enabled=True, priority=1
         role_mappings = "[]"
     elif isinstance(role_mappings, (list, dict)):
         role_mappings = json.dumps(role_mappings, ensure_ascii=False)
+    # 新增 mapping 时，若 enabled=False 则 disable_reason='manual'（用户手动禁用），
+    # 否则 disable_reason=''（正常启用态），与 update_model_mapping 的自动管理逻辑对齐。
+    disable_reason = "manual" if not enabled else ""
     c.execute(
-        "INSERT INTO model_mappings (alias, target_model, provider_id, priority, model_type, max_tokens, enabled, role_mappings, reasoning_effort_supported, think_injection, reasoning_content_field, native_responses) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (alias, target_model, provider_id, int(priority), model_type, int(max_tokens), int(enabled), role_mappings, int(reasoning_effort_supported), int(think_injection), int(reasoning_content_field), int(native_responses)),
+        "INSERT INTO model_mappings (alias, target_model, provider_id, priority, model_type, max_tokens, enabled, role_mappings, reasoning_effort_supported, think_injection, reasoning_content_field, native_responses, disable_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (alias, target_model, provider_id, int(priority), model_type, int(max_tokens), int(enabled), role_mappings, int(reasoning_effort_supported), int(think_injection), int(reasoning_content_field), int(native_responses), disable_reason),
     )
     conn.commit()
     mapping_id = c.lastrowid
@@ -1476,7 +1627,7 @@ def add_model_mapping(alias, target_model, provider_id, enabled=True, priority=1
 
 
 def update_model_mapping(mapping_id, **kwargs):
-    allowed = {"alias", "target_model", "provider_id", "enabled", "priority", "model_type", "max_tokens", "role_mappings", "reasoning_effort_supported", "think_injection", "reasoning_content_field", "native_responses"}
+    allowed = {"alias", "target_model", "provider_id", "enabled", "priority", "model_type", "max_tokens", "role_mappings", "reasoning_effort_supported", "think_injection", "reasoning_content_field", "native_responses", "disable_reason"}
     fields = []
     values = []
     for k, v in kwargs.items():
@@ -1489,6 +1640,20 @@ def update_model_mapping(mapping_id, **kwargs):
                 values.append(v)
             else:
                 values.append(int(v) if k in ("enabled", "priority", "max_tokens", "reasoning_effort_supported", "think_injection", "reasoning_content_field", "native_responses") else v)
+    # 手动启停 mapping 时自动管理 disable_reason（与 providers 表设计对齐）：
+    #   手动禁用（enabled=0）且未显式指定 reason → 标记 'manual'，
+    #     provider 联动启用时只恢复 'provider_disabled' 的 mapping，保留 'manual' 的禁用状态。
+    #   手动启用（enabled=1）→ 清空 disable_reason（无论原值，恢复正常态）。
+    # 前端 toggleModel 只需传 enabled，后端自动维护联动语义所需的标记。
+    if "enabled" in kwargs:
+        if int(kwargs["enabled"]):
+            if "disable_reason" not in kwargs:
+                fields.append("disable_reason = ?")
+                values.append("")
+        else:
+            if "disable_reason" not in kwargs:
+                fields.append("disable_reason = ?")
+                values.append("manual")
     if not fields:
         return
     values.append(mapping_id)
@@ -2151,6 +2316,8 @@ def reset_expired_windows_and_reenable():
                 "UPDATE providers SET enabled = 1, disable_reason = '' WHERE id = ?",
                 (provider_id,),
             )
+            # 级联启用该 provider 下所有 model_mappings
+            _cascade_provider_enabled_to_mappings(conn, provider_id, 1)
             conn.commit()
             reenabled.append(provider_name)
 
