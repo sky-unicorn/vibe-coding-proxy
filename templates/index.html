@@ -181,6 +181,42 @@ tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
 .feature-toast-body strong{color:var(--text)}
 .feature-toast-timer{height:3px;background:var(--border);border-radius:2px;margin-top:16px;overflow:hidden}
 .feature-toast-timer-bar{height:100%;background:var(--primary);border-radius:2px;width:100%;transition:width linear}
+/* MCP / Nacos Tab 视觉规范 */
+.mcp-url-bar{display:flex;align-items:center;gap:10px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin-bottom:12px;transition:border-color .15s}
+.mcp-url-bar:hover{border-color:rgba(99,102,241,.4)}
+.mcp-url-bar .url-label{font-size:12px;font-weight:600;white-space:nowrap}
+.mcp-url-bar code{font-family:monospace;font-size:13px;flex:1;user-select:all;cursor:pointer;color:var(--text);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mcp-url-bar .copy-btn-mcp{background:var(--border);color:var(--text);padding:4px 12px;border-radius:5px;border:none;cursor:pointer;font-size:12px;font-weight:500;transition:background .15s,color .15s;flex-shrink:0}
+.mcp-url-bar .copy-btn-mcp:hover{background:var(--primary);color:#fff}
+/* 二级按钮（测试连接 / 复制 等弱化主操作）统一外观，区分于 btn-primary */
+.btn-secondary{background:var(--border);color:var(--text);border:1px solid var(--border)}
+.btn-secondary:hover{background:rgba(99,102,241,.15);color:var(--primary-h);border-color:rgba(99,102,241,.4)}
+/* 行内 code 标签（form 提示文字里的内联 code），统一紫调 */
+.inline-code{background:rgba(99,102,241,.15);color:var(--primary-h);padding:1px 5px;border-radius:3px;font-size:11px;font-family:monospace}
+/* 表单字段下方的小号说明文字 */
+.form-hint{font-size:11px;color:var(--text2);margin-top:4px;display:block;line-height:1.5}
+.form-hint code{background:rgba(99,102,241,.15);color:var(--primary-h);padding:1px 5px;border-radius:3px;font-size:11px}
+/* details 折叠区：summary hover、展开箭头 */
+details.mcp-details{margin-top:14px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:2px 14px}
+details.mcp-details>summary{cursor:pointer;font-size:13px;color:var(--text2);user-select:none;padding:10px 0;list-style:none;display:flex;align-items:center;gap:6px;transition:color .15s}
+details.mcp-details>summary::-webkit-details-marker{display:none}
+details.mcp-details>summary::before{content:'▸';color:var(--text2);font-size:11px;transition:transform .15s;display:inline-block}
+details.mcp-details[open]>summary::before{transform:rotate(90deg)}
+details.mcp-details>summary:hover{color:var(--text)}
+details.mcp-details[open]>summary{border-bottom:1px solid var(--border);margin-bottom:12px}
+.mcp-code-sample-label{font-size:12px;color:var(--text2);margin-bottom:4px}
+.mcp-code-sample-label code{background:rgba(99,102,241,.15);color:var(--primary-h);padding:1px 5px;border-radius:3px;font-size:11px}
+pre.mcp-code-block{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:12px;font-family:monospace;font-size:12px;overflow-x:auto;color:var(--text);line-height:1.5;margin:0}
+/* 工具清单表：允许说明列换行、工具名等宽对齐、hover 高亮 */
+#panel-mcp .mcp-tools-table{min-width:640px}
+#panel-mcp .mcp-tools-table th,#panel-mcp .mcp-tools-table td{vertical-align:middle}
+#panel-mcp .mcp-tools-table td.tool-desc{white-space:normal;line-height:1.5;color:var(--text2);min-width:260px}
+#panel-mcp .mcp-tools-table td.tool-name{white-space:nowrap}
+#panel-mcp .mcp-tools-table code{font-family:monospace;font-size:12px;color:var(--primary-h)}
+/* MCP 端点提示框（warn 色调左条），与 rm-tip 同语言 */
+.mcp-tip{background:var(--bg);border:1px solid var(--border);border-left:3px solid var(--primary);border-radius:6px;padding:10px 12px;font-size:12px;line-height:1.6;color:var(--text2)}
+.mcp-tip.tip-warn{border-left-color:var(--warn)}
+.mcp-tip strong{color:var(--text)}
 </style>
 </head>
 <body>
@@ -205,6 +241,7 @@ tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
   <div class="tab" onclick="switchTab('logs')">请求日志</div>
   <div class="tab" onclick="switchTab('apikeys')">API Key</div>
   <div class="tab" onclick="switchTab('billing')">计费管理</div>
+  <div class="tab" onclick="switchTab('mcp')">MCP / Nacos</div>
 </div>
 
 <div class="content">
@@ -357,6 +394,98 @@ tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
         <tbody id="billing-tbody"></tbody>
       </table>
       <div id="billing-table-empty" class="empty" style="display:none">暂无计费数据</div>
+    </div>
+  </div>
+
+  <!-- MCP / Nacos -->
+  <div id="panel-mcp" class="panel">
+    <!-- MCP 客户端配置（headers-only） -->
+    <div class="card">
+      <div class="card-header"><h2>MCP 客户端配置</h2></div>
+      <p style="font-size:13px;color:var(--text2);margin-bottom:14px;line-height:1.6">Nacos 连接参数<strong style="color:var(--text)">不再在此项目配置</strong>，而是在你的 AI 客户端（Claude Code / Codex）的 MCP server 配置里通过 HTTP headers 提供，每次请求自动携带给 <code class="inline-code">/mcp</code>。下方「MCP 端点」卡片有完整的可复制配置示例。</p>
+      <div class="mcp-tip">
+        需要提供的 4 个 header（大小写敏感，<strong style="color:var(--text)">每次请求自动携带</strong>）：
+        <table class="mcp-tools-table" style="margin-top:10px;width:100%;min-width:0">
+          <thead><tr><th style="width:230px">Header</th><th>含义</th></tr></thead>
+          <tbody>
+            <tr><td class="tool-name"><code>X-Nacos-Console-Url</code></td><td class="tool-desc">Console API 基址（命名空间 / 配置 CRUD），merged 部署通常<strong>不带</strong> <code>/nacos</code>，如 <code>http://host:8848</code></td></tr>
+            <tr><td class="tool-name"><code>X-Nacos-Auth-Url</code></td><td class="tool-desc">认证基址，通常<strong>带</strong> <code>/nacos</code>，如 <code>http://host:8848/nacos</code></td></tr>
+            <tr><td class="tool-name"><code>X-Nacos-Username</code></td><td class="tool-desc">Nacos 登录用户名（如 <code>nacos</code>）</td></tr>
+            <tr><td class="tool-name"><code>X-Nacos-Password</code></td><td class="tool-desc">Nacos 登录密码</td></tr>
+          </tbody>
+        </table>
+        <div style="margin-top:10px"><strong style="color:var(--text)">注意：</strong>项目 API Key 单独走 <code class="inline-code">Authorization: Bearer &lt;key&gt;</code>，与上面 4 个 Nacos header 并存。账号密码不会落地本项目数据库。</div>
+      </div>
+    </div>
+
+    <!-- MCP 端点信息 -->
+    <div class="card">
+      <div class="card-header"><h2>MCP 端点</h2></div>
+      <div class="mcp-url-bar">
+        <span class="url-label anthropic">MCP URL</span>
+        <code id="mcp-url"></code>
+        <button class="copy-btn-mcp" onclick="copyToClipboard('mcp-url')">复制</button>
+      </div>
+      <div class="mcp-tip tip-warn">
+        <strong style="color:var(--warn)">API Key：</strong>请到 <strong>API Key</strong> Tab 复制你已创建的 key，或新建后立即保存。在 Claude Code / Codex 的 MCP 配置里填此 URL，并在请求头携带 <code>Authorization: Bearer &lt;你的项目 API Key&gt;</code>。
+      </div>
+
+      <details class="mcp-details">
+        <summary>查看配置示例（Claude Code / Codex）</summary>
+        <div style="display:flex;flex-direction:column;gap:14px;margin-bottom:12px">
+          <div>
+            <div class="mcp-code-sample-label">Claude Code（<code>.mcp.json</code> 或全局配置）：</div>
+            <pre class="mcp-code-block">{
+  "mcpServers": {
+    "nacos": {
+      "url": "<span id="mcp-url-sample"></span>",
+      "type": "http",
+      "headers": {
+        "Authorization": "Bearer &lt;你的项目 API Key&gt;",
+        "X-Nacos-Console-Url": "http://your-nacos-host:8848",
+        "X-Nacos-Auth-Url": "http://your-nacos-host:8848/nacos",
+        "X-Nacos-Username": "nacos",
+        "X-Nacos-Password": "你的Nacos密码"
+      }
+    }
+  }
+}</pre>
+          </div>
+          <div>
+            <div class="mcp-code-sample-label">Codex CLI（<code>config.toml</code> 中追加）：</div>
+            <pre class="mcp-code-block">[mcp_servers.nacos]
+url = "<span id="mcp-url-sample2"></span>"
+bearer_token = "&lt;你的项目 API Key&gt;"
+
+[mcp_servers.nacos.http_headers]
+X-Nacos-Console-Url = "http://your-nacos-host:8848"
+X-Nacos-Auth-Url = "http://your-nacos-host:8848/nacos"
+X-Nacos-Username = "nacos"
+X-Nacos-Password = "你的Nacos密码"</pre>
+            <span class="form-hint" style="margin-top:6px">Codex CLI 已支持 <code>http_headers</code>（<a href="https://github.com/openai/codex/issues/5180" target="_blank" style="color:var(--primary-h)">#5180</a>，已发布）。<code>bearer_token</code> 是 Codex 的 Authorization Bearer 简写；也可用 <code>bearer_token_env_var = "NACOS_MCP_API_KEY"</code> 从环境变量取。</span>
+          </div>
+        </div>
+      </details>
+    </div>
+
+    <!-- 工具清单 -->
+    <div class="card">
+      <div class="card-header"><h2>工具清单（9 个）</h2></div>
+      <p style="font-size:13px;color:var(--text2);margin-bottom:12px;line-height:1.6">AI 客户端通过 MCP 可调用的 Nacos 管理工具。工具名统一以 <code class="inline-code">nacos_</code> 前缀。</p>
+      <table class="mcp-tools-table">
+        <thead><tr><th>工具名</th><th>类别</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td class="tool-name"><code>nacos_list_namespaces</code></td><td><span class="badge badge-anthropic">命名空间</span></td><td class="tool-desc">列出全部命名空间（含 public）</td></tr>
+          <tr><td class="tool-name"><code>nacos_create_namespace</code></td><td><span class="badge badge-anthropic">命名空间</span></td><td class="tool-desc">创建命名空间（id 可选，省略由服务端生成）</td></tr>
+          <tr><td class="tool-name"><code>nacos_update_namespace</code></td><td><span class="badge badge-anthropic">命名空间</span></td><td class="tool-desc">修改命名空间名称/描述（id 不可改）</td></tr>
+          <tr><td class="tool-name"><code>nacos_delete_namespace</code></td><td><span class="badge badge-anthropic">命名空间</span></td><td class="tool-desc">删除命名空间（public 不可删）</td></tr>
+          <tr><td class="tool-name"><code>nacos_list_configs</code></td><td><span class="badge badge-openai">配置</span></td><td class="tool-desc">分页查询配置列表，支持 dataId/group 搜索</td></tr>
+          <tr><td class="tool-name"><code>nacos_get_config</code></td><td><span class="badge badge-openai">配置</span></td><td class="tool-desc">读取单个配置完整内容（含 type、md5）</td></tr>
+          <tr><td class="tool-name"><code>nacos_publish_config</code></td><td><span class="badge badge-openai">配置</span></td><td class="tool-desc">发布配置（存在即覆盖，新增/修改合一）</td></tr>
+          <tr><td class="tool-name"><code>nacos_delete_config</code></td><td><span class="badge badge-openai">配置</span></td><td class="tool-desc">删除单个配置</td></tr>
+          <tr><td class="tool-name"><code>nacos_get_config_history</code></td><td><span class="badge badge-openai">配置</span></td><td class="tool-desc">查询配置历史版本</td></tr>
+        </tbody>
+      </table>
     </div>
   </div>
 </div>
@@ -598,6 +727,7 @@ function switchTab(name){
   if(name==='logs'){loadLogProviders();loadLogs();loadCleanupSettings();}
   if(name==='apikeys') loadApiKeys();
   if(name==='billing') loadBillingOverview();
+  if(name==='mcp') updateMcpUrl();
 }
 window.addEventListener('DOMContentLoaded',()=>{
   const h=location.hash.replace('#','');
@@ -1476,6 +1606,33 @@ async function editProviderBilling(pid){
   document.getElementById('bp-billing-id').textContent=b?'exists':'';
   toggleBillingFieldsBp();
   document.getElementById('billing-drawer-overlay').classList.add('active');
+}
+
+// ---- MCP / Nacos ----
+function updateMcpUrl(){
+  const url=location.protocol+'//'+location.host+'/mcp';
+  document.getElementById('mcp-url').textContent=url;
+  const samples=document.querySelectorAll('#mcp-url-sample, #mcp-url-sample2');
+  samples.forEach(el=>el.textContent=url);
+}
+function copyToClipboard(inputId){
+  const el=document.getElementById(inputId);
+  if(!el)return;
+  const text=el.textContent||el.value;
+  navigator.clipboard.writeText(text).then(()=>{showFeatureToast('已复制','已复制到剪贴板：'+text);}).catch(()=>{
+    // fallback
+    const r=document.createRange();r.selectNode(el);window.getSelection().removeAllRanges();window.getSelection().addRange(r);document.execCommand('copy');window.getSelection().removeAllRanges();
+    showFeatureToast('已复制','已复制到剪贴板');
+  });
+}
+function togglePwVisibility(inputId,btn){
+  const input=document.getElementById(inputId);
+  const isPassword=input.type==='password';
+  input.type=isPassword?'text':'password';
+  btn.innerHTML=isPassword
+    ?'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg>'
+    :'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>';
+  btn.title=isPassword?'隐藏密码':'显示/隐藏密码';
 }
 
 // ---- Utils ----

@@ -1175,7 +1175,6 @@ def _create_latest_schema(conn):
         INSERT OR IGNORE INTO settings (key, value) VALUES ('last_cleanup_time', '');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('degradation_enabled', '0');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('degradation_duration', '30');
-
         CREATE TABLE IF NOT EXISTS provider_billing_config (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             provider_id INTEGER NOT NULL UNIQUE,
@@ -1914,11 +1913,12 @@ def set_setting(key, value):
     conn.close()
 
 
-def get_all_settings():
+def get_all_settings(mask_secrets=False):
     conn = get_conn()
     rows = conn.execute("SELECT * FROM settings").fetchall()
     conn.close()
-    return {r["key"]: r["value"] for r in rows}
+    result = {r["key"]: r["value"] for r in rows}
+    return result
 
 
 def get_degradation_config():

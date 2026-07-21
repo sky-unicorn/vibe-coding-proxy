@@ -5,6 +5,7 @@ import time as _time
 from flask import Flask, request, jsonify, Response, render_template, session, redirect, url_for
 import config
 import proxy
+import mcp_server
 from version import APP_VERSION, RELEASES_URL, GITHUB_LATEST_API
 
 # Windows 控制台默认用 GBK 编码，直接 print 中文会乱码；强制 stdout/stderr 用 UTF-8。
@@ -30,7 +31,7 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 # ---- 认证中间件 ----
 
 # 不需要登录就能访问的路由前缀
-_PUBLIC_PREFIXES = ("/anthropic", "/v1", "/openai")
+_PUBLIC_PREFIXES = ("/anthropic", "/v1", "/openai", "/mcp")
 # 登录相关路由
 _AUTH_ROUTES = ("/api/auth/login",)
 
@@ -65,6 +66,17 @@ def check_auth():
 def _check_api_key():
     """对代理路由进行API Key校验"""
     path = request.path
+
+    # /mcp 路由：对所有 HTTP 方法强制校验（防御性，即便只暴露 POST）
+    if path.startswith("/mcp"):
+        api_key = request.headers.get("x-api-key", "")
+        if not api_key:
+            auth = request.headers.get("Authorization", "")
+            if auth.startswith("Bearer "):
+                api_key = auth[7:]
+        if not config.validate_api_key(api_key):
+            return jsonify({"error": "无效的 API Key"}), 401
+        return None
 
     # 代理路由：非POST不需要API Key
     if request.method != "POST":
@@ -237,7 +249,44 @@ def openai_responses_proxy():
     return Response(content, status=status_code, headers=headers)
 
 
-# ---- Providers API ----
+# ---- MCP Server 端点 ----
+
+@app.route("/mcp", methods=["POST"])
+def mcp_endpoint():
+    """MCP JSON-RPC 2.0 端点。
+
+    解析单条 JSON-RPC 请求并分发；批量请求（数组）返回 -32600 不支持；
+    notification（无 id）返回 202 空体。
+    """
+    try:
+        req = request.get_json(force=True)
+    except Exception:
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": "Parse error"},
+        }), 400
+
+    # 批量请求首版不支持
+    if isinstance(req, list):
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32600, "message": "Invalid Request: 批量请求暂不支持"},
+        }), 400
+
+    # Nacos 连接参数由 MCP 客户端每次请求通过 HTTP headers 携带，服务端不落盘
+    nacos_conn = {
+        "console_url": (request.headers.get("X-Nacos-Console-Url") or "").strip(),
+        "auth_url": (request.headers.get("X-Nacos-Auth-Url") or "").strip(),
+        "username": (request.headers.get("X-Nacos-Username") or "").strip(),
+        "password": (request.headers.get("X-Nacos-Password") or "").strip(),
+    }
+    resp = mcp_server.handle_jsonrpc(req, nacos_conn)
+    if resp is None:
+        # notification（notifications/initialized 等），无响应体
+        return "", 202
+    return jsonify(resp)
 
 @app.route("/api/providers", methods=["GET"])
 def api_get_providers():
@@ -380,7 +429,7 @@ def api_delete_error_mapping(mapping_id):
 
 @app.route("/api/settings", methods=["GET"])
 def api_get_settings():
-    return jsonify(config.get_all_settings())
+    return jsonify(config.get_all_settings(mask_secrets=True))
 
 
 @app.route("/api/settings", methods=["PUT"])
@@ -733,6 +782,7 @@ if __name__ == "__main__":
     print(f"  Anthropic 代理: http://localhost:{server_port}/anthropic")
     print(f"  OpenAI 代理:    http://localhost:{server_port}/v1")
     print(f"  Responses 代理: http://localhost:{server_port}/openai")
+    print(f"  MCP / Nacos:    http://localhost:{server_port}/mcp")
     print("=" * 50)
     # 打包后必须关闭 debug/reloader：reloader 会 fork 子进程，但 PyInstaller 打包后
     # 子进程无法找到原入口文件，会立即挂掉。
