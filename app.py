@@ -16,6 +16,29 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+    # 关闭命令行窗口（点右上角 X / 系统注销 / 关机）时，系统向所有附着进程发送
+    # CTRL_CLOSE / CTRL_LOGOFF / CTRL_SHUTDOWN 事件。这不是 Unix signal，Python 的
+    # signal 模块和 Werkzeug 的 SIGINT handler 都收不到；Werkzeug 的 socket.accept()
+    # 阻塞在 C 层时也不主动响应，于是窗口关闭后 Python 进程残留、继续占用端口
+    # （PyInstaller 打包的 console exe 尤为明显）。注册一个控制台 handler，在收到上述
+    # 事件时 os._exit(0) 立即强制退出，保证"关闭窗口=进程退出"。
+    # 注：系统对 CTRL_CLOSE 的处理时间只有 ~5 秒，超时会被强制 terminate，
+    # 所以不能用 sys.exit()/raise SystemExit 等优雅退出路径（会跑 finally，可能卡住）。
+    import ctypes as _ctypes
+    import os as _os
+
+    def _on_console_ctrl(ctrl_type):
+        # CTRL_C_EVENT=0, CTRL_BREAK_EVENT=1, CTRL_CLOSE_EVENT=2,
+        # CTRL_LOGOFF_EVENT=5, CTRL_SHUTDOWN_EVENT=6
+        if ctrl_type in (2, 5, 6):
+            _os._exit(0)
+        return False  # CTRL_C/BREAK 交给默认 handler，保留 Ctrl+C 中断行为
+
+    _HandlerRoutine = _ctypes.WINFUNCTYPE(_ctypes.c_int, _ctypes.c_uint)
+    _console_ctrl_handler = _HandlerRoutine(_on_console_ctrl)
+    # handler 对象必须模块级保活，否则 ctypes 回调对象被 GC 后 C 层函数指针悬空
+    _ctypes.windll.kernel32.SetConsoleCtrlHandler(_console_ctrl_handler, True)
+
 app = Flask(__name__)
 config.init_db()
 
