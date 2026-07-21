@@ -217,6 +217,19 @@ pre.mcp-code-block{background:var(--card);border:1px solid var(--border);border-
 .mcp-tip{background:var(--bg);border:1px solid var(--border);border-left:3px solid var(--primary);border-radius:6px;padding:10px 12px;font-size:12px;line-height:1.6;color:var(--text2)}
 .mcp-tip.tip-warn{border-left-color:var(--warn)}
 .mcp-tip strong{color:var(--text)}
+/* MCP 广场：卡片网格（豆腐块） */
+.mcp-square{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px;margin-bottom:8px}
+.mcp-card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;display:flex;flex-direction:column;gap:10px;cursor:pointer;transition:border-color .2s,transform .2s}
+.mcp-card:hover{border-color:var(--primary);transform:translateY(-2px)}
+.mcp-card.expanded{border-color:var(--primary)}
+.mcp-card-icon{width:40px;height:40px;border-radius:8px;background:rgba(99,102,241,.18);color:var(--primary-h);display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;flex-shrink:0}
+.mcp-card-title{font-size:15px;font-weight:600;line-height:1.4}
+.mcp-card-desc{font-size:12px;color:var(--text2);line-height:1.55}
+.mcp-card-stats{display:flex;gap:6px;flex-wrap:wrap}
+.mcp-stat{font-size:11px;color:var(--text2);background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:3px 8px;white-space:nowrap}
+.mcp-stat strong{color:var(--text);font-weight:600}
+.mcp-card-toggle{align-self:flex-start;background:none;border:none;color:var(--primary-h);font-size:12px;cursor:pointer;padding:0;margin-top:2px}
+.mcp-card-toggle:hover{text-decoration:underline}
 </style>
 </head>
 <body>
@@ -241,7 +254,7 @@ pre.mcp-code-block{background:var(--card);border:1px solid var(--border);border-
   <div class="tab" onclick="switchTab('logs')">请求日志</div>
   <div class="tab" onclick="switchTab('apikeys')">API Key</div>
   <div class="tab" onclick="switchTab('billing')">计费管理</div>
-  <div class="tab" onclick="switchTab('mcp')">MCP / Nacos</div>
+  <div class="tab" onclick="switchTab('mcp')">MCP 广场</div>
 </div>
 
 <div class="content">
@@ -399,6 +412,33 @@ pre.mcp-code-block{background:var(--card);border:1px solid var(--border);border-
 
   <!-- MCP / Nacos -->
   <div id="panel-mcp" class="panel">
+    <!-- MCP 广场：卡片网格。新增 MCP 时在 .mcp-square 内追加一张 .mcp-card(id=mcp-card-<name>) + 一个 #mcp-<name>-detail 详情块，toggleMcpDetail('<name>') 自动接管 -->
+    <div style="margin-bottom:18px">
+      <h2 style="font-size:18px;font-weight:600">MCP 广场</h2>
+      <p style="font-size:13px;color:var(--text2);margin-top:6px;line-height:1.6">所有可用的 MCP 服务。在 AI 客户端（Claude Code / Codex）配置对应端点与 headers 即可调用，点击卡片展开配置详情。</p>
+    </div>
+
+    <div class="mcp-square">
+      <div class="mcp-card expanded" id="mcp-card-nacos" onclick="toggleMcpDetail('nacos')">
+        <div style="display:flex;gap:12px;align-items:center">
+          <div class="mcp-card-icon">N</div>
+          <div>
+            <div class="mcp-card-title">Nacos MCP</div>
+            <span class="badge badge-anthropic">HTTP</span>
+          </div>
+        </div>
+        <div class="mcp-card-desc">通过 MCP 协议远程管理 Nacos 3.x 命名空间与配置--让 AI 直接读取、发布、回滚配置。</div>
+        <div class="mcp-card-stats">
+          <span class="mcp-stat"><strong>9</strong> 个工具</span>
+          <span class="mcp-stat">端点 <strong>/mcp</strong></span>
+          <span class="mcp-stat">连接参数 <strong>headers</strong></span>
+        </div>
+        <button class="mcp-card-toggle">收起 ▴</button>
+      </div>
+    </div>
+
+    <!-- Nacos 配置详情（默认展开） -->
+    <div id="mcp-nacos-detail">
     <!-- MCP 客户端配置（headers-only） -->
     <div class="card">
       <div class="card-header"><h2>MCP 客户端配置</h2></div>
@@ -487,6 +527,7 @@ X-Nacos-Password = "你的Nacos密码"</pre>
         </tbody>
       </table>
     </div>
+    </div><!-- /Nacos 配置详情 -->
   </div>
 </div>
 
@@ -1608,7 +1649,16 @@ async function editProviderBilling(pid){
   document.getElementById('billing-drawer-overlay').classList.add('active');
 }
 
-// ---- MCP / Nacos ----
+// ---- MCP 广场 ----
+function toggleMcpDetail(name){
+  const card=document.getElementById('mcp-card-'+name);
+  const detail=document.getElementById('mcp-'+name+'-detail');
+  if(!card||!detail)return;
+  const expanded=card.classList.toggle('expanded');
+  detail.style.display=expanded?'':'none';
+  const btn=card.querySelector('.mcp-card-toggle');
+  if(btn)btn.textContent=expanded?'收起 ▴':'展开 ▾';
+}
 function updateMcpUrl(){
   const url=location.protocol+'//'+location.host+'/mcp';
   document.getElementById('mcp-url').textContent=url;
