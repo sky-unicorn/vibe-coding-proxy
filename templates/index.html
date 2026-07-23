@@ -266,17 +266,7 @@ pre.mcp-code-block{background:var(--card);border:1px solid var(--border);border-
 <div class="content">
   <!-- 提供商管理 -->
   <div id="panel-providers" class="panel active">
-    <div class="card">
-      <div class="card-header">
-        <h2>API 提供商</h2>
-        <button class="btn btn-primary" onclick="openProviderModal()">添加提供商</button>
-      </div>
-      <table>
-        <thead><tr><th>名称</th><th>Anthropic URL</th><th>OpenAI URL</th><th>API Key</th><th>并行</th><th>并发</th><th>Token</th><th>调用</th><th>计费</th><th>状态</th><th>操作</th></tr></thead>
-        <tbody id="providers-tbody"></tbody>
-      </table>
-      <div id="providers-empty" class="empty" style="display:none">暂无提供商，点击上方按钮添加</div>
-    </div>
+    <div id="vue-providers"></div>
   </div>
 
   <!-- 模型映射 -->
@@ -515,32 +505,6 @@ X-Nacos-Password = "你的Nacos密码"</pre>
   </div>
 </div>
 
-<!-- 提供商 Modal -->
-<div class="modal-overlay" id="provider-modal">
-  <div class="modal">
-    <h3 id="provider-modal-title">添加提供商</h3>
-    <input type="hidden" id="provider-edit-id">
-    <div class="form-group"><label>名称</label><input id="pf-name" placeholder="如: Anthropic Official"></div>
-    <div class="form-group"><label>Anthropic URL</label><input id="pf-anthropic-url" placeholder="完整端点（推荐），如 https://api.anthropic.com/v1/messages。关闭下方「完整路径」开关后可填 base 路径，系统自动拼接 /v1/messages。留空则不转发 Anthropic 协议请求"></div>
-    <div class="form-group"><label>OpenAI URL</label><input id="pf-openai-url" placeholder="完整端点（推荐），如 https://api.openai.com/v1/chat/completions。关闭下方「完整路径」开关后可填 base 路径，系统自动拼接 /chat/completions。留空则不转发 OpenAI 协议请求"></div>
-    <div class="form-group"><label>API Key</label><div class="input-with-toggle"><input id="pf-key" type="password" placeholder="sk-ant-..."><button type="button" class="input-toggle-btn" id="pf-key-toggle" onclick="togglePasswordVisibility('pf-key',this)" title="显示/隐藏密钥" aria-label="显示/隐藏密钥"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></button></div></div>
-    <div class="form-group"><label>最大并行数</label><input id="pf-concurrency" type="number" placeholder="0 = 不限制" min="0" max="100" value="0"><span style="font-size:11px;color:var(--text2);margin-top:2px;display:block">0 表示不限制并发，超过限制的请求将排队等待（不会断开连接）</span></div>
-    <div class="form-group" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-      <label class="toggle"><input type="checkbox" id="pf-full-path" checked onchange="updateUrlPlaceholders()"><span class="toggle-slider"></span></label>
-      <span style="font-size:13px">完整路径（不自动拼接）</span>
-      <span style="font-size:11px;color:var(--text2);flex:1 1 100%;margin-top:2px">关闭=自动拼接 /v1/messages(Anthropic) 与 /chat/completions(OpenAI)；打开=原样使用</span>
-    </div>
-    <div class="form-group" style="display:flex;align-items:center;gap:8px">
-      <label class="toggle"><input type="checkbox" id="pf-enabled" checked><span class="toggle-slider"></span></label>
-      <span style="font-size:13px">启用</span>
-    </div>
-    <div class="form-actions">
-      <button class="btn" style="background:var(--border);color:var(--text)" onclick="closeProviderModal()">取消</button>
-      <button class="btn btn-primary" onclick="saveProvider()">保存</button>
-    </div>
-  </div>
-</div>
-
 <!-- 模型映射 Modal -->
 <div class="modal-overlay" id="model-modal">
   <div class="modal">
@@ -697,7 +661,7 @@ function switchTab(name){
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   document.getElementById('panel-'+name).classList.add('active');
   if(location.hash!=='#'+name) history.replaceState(null,'','#'+name);
-  if(name==='providers') loadProviders();
+  if(name==='providers') window.__reloadProviders?.();
   if(name==='models'){loadDegradationSettings();loadModels();}
   if(name==='logs'){loadLogProviders();loadLogs();loadCleanupSettings();}
   if(name==='billing') loadBillingOverview();
@@ -708,118 +672,6 @@ window.addEventListener('DOMContentLoaded',()=>{
   const valid=['providers','models','errors','logs','apikeys','billing','mcp'];
   if(valid.includes(h)) switchTab(h);
 });
-
-// ---- Providers ----
-let _concurrencyData={};
-async function loadProviders(){
-  const [r,conc,stats,billingOv]=await Promise.all([fetch(API+'/api/providers').then(r=>r.json()),fetch(API+'/api/concurrency').then(r=>r.json()),fetch(API+'/api/providers/stats').then(r=>r.json()).catch(()=>[]),fetch(API+'/api/providers/billing/overview').then(r=>r.json()).catch(()=>[])]);
-
-  _concurrencyData=conc;
-  const billingMap={};
-  (billingOv||[]).forEach(b=>{if(b.has_billing) billingMap[b.provider_id]=b.billing_config;});
-  r.forEach(p=>{p._billing=billingMap[p.id]||null;});
-  const statsMap={};
-  stats.forEach(s=>{statsMap[s.provider]=s});
-  const tb=document.getElementById('providers-tbody');
-  const empty=document.getElementById('providers-empty');
-  if(!r.length){tb.innerHTML='';empty.style.display='';return}
-  empty.style.display='none';
-  tb.innerHTML=r.map(p=>{
-    const maxC=p.max_concurrency||0;
-    const c=conc[p.id]||{used:0,max:0};
-    const concHtml=renderConcurrencyBar(c.used,maxC||Infinity);
-    const st=statsMap[p.name];
-    const totalTokens=st?(st.total_input_tokens+st.total_output_tokens):0;
-    const callCount=st?st.request_count:0;
-    return `<tr>
-    <td>${esc(p.name)}</td>
-    <td title="${esc(p.anthropic_url||'')}"><code style="font-size:12px">${p.anthropic_url?truncateUrl(p.anthropic_url):'<span style="color:var(--text2)">-</span>'}</code>${p.anthropic_url?(p.full_path?'<span class="badge badge-success" style="font-size:10px;margin-left:4px">完整</span>':'<span class="badge badge-warn" style="font-size:10px;margin-left:4px">拼接</span>'):''}</td>
-    <td title="${esc(p.openai_url||'')}"><code style="font-size:12px">${p.openai_url?truncateUrl(p.openai_url):'<span style="color:var(--text2)">-</span>'}</code>${p.openai_url?(p.full_path?'<span class="badge badge-success" style="font-size:10px;margin-left:4px">完整</span>':'<span class="badge badge-warn" style="font-size:10px;margin-left:4px">拼接</span>'):''}</td>
-    <td><span class="key-mask">${maskKey(p.api_key)}</span></td>
-    <td>${maxC>0?maxC:'<span style="color:var(--text2)">-</span>'}</td>
-    <td>${concHtml}</td>
-    <td><code style="font-size:12px">${totalTokens?formatTokens(totalTokens):'<span style="color:var(--text2)">-</span>'}</code></td>
-    <td><code style="font-size:12px">${callCount>0?callCount:'<span style="color:var(--text2)">0</span>'}</code></td>
-    <td>${p._billing?`<span class="badge badge-billing-${p._billing.billing_mode}">${billingModeLabel(p._billing.billing_mode)}</span>`:'<span class="badge badge-billing-none">不限</span>'}</td>
-    <td><label class="toggle" title="${p.enabled?'点击禁用':'点击启用'}"><input type="checkbox" ${p.enabled?'checked':''} onchange="toggleProvider(${p.id},this.checked)"><span class="toggle-slider"></span></label> <span class="badge ${p.enabled?'badge-success':'badge-error'}" style="margin-left:4px">${p.enabled?'启用':'禁用'}</span></td>
-    <td style="white-space:nowrap"><div style="display:flex;gap:4px">
-      <button class="btn btn-sm" style="background:var(--border);color:var(--text)" onclick="editProvider(_dataStore.providers[${_store('providers',p)}])">编辑</button>
-      <button class="btn btn-sm" style="background:var(--border);color:var(--text)" onclick="editProviderBilling(${p.id})">计费</button>
-      <button class="btn btn-danger btn-sm" onclick="delProvider(${p.id})">删除</button>
-    </div></td>
-  </tr>`}).join('');
-}
-function renderConcurrencyBar(used,max){
-  if(max===Infinity||!max||max<=0){
-    return `<div class="concurrency-bar"><div class="bar"><div class="bar-fill ok" style="width:0%"></div></div><span class="label">${used}/∞</span></div>`;
-  }
-  const pct=Math.min(100,Math.round(used/max*100));
-  const cls=pct>=100?'full':pct>=70?'warn':'ok';
-  return `<div class="concurrency-bar"><div class="bar"><div class="bar-fill ${cls}" style="width:${pct}%"></div></div><span class="label">${used}/${max}</span></div>`;
-}
-function openProviderModal(p){
-  document.getElementById('provider-modal-title').textContent=p?'编辑提供商':'添加提供商';
-  document.getElementById('provider-edit-id').value=p?p.id:'';
-  document.getElementById('pf-name').value=p?p.name:'';
-  document.getElementById('pf-anthropic-url').value=p?(p.anthropic_url||''):'';
-  document.getElementById('pf-openai-url').value=p?(p.openai_url||''):'';
-  document.getElementById('pf-key').value=p?p.api_key:'';
-  resetPasswordToggle('pf-key');
-  document.getElementById('pf-concurrency').value=p?(p.max_concurrency||0):0;
-  document.getElementById('pf-full-path').checked=p?(p.full_path!=null?!!p.full_path:true):true;
-  document.getElementById('pf-enabled').checked=p?p.enabled:true;
-  updateUrlPlaceholders();
-  document.getElementById('provider-modal').classList.add('active');
-}
-function updateUrlPlaceholders(){
-  const full=document.getElementById('pf-full-path').checked;
-  const anth=document.getElementById('pf-anthropic-url');
-  const oai=document.getElementById('pf-openai-url');
-  if(full){
-    anth.placeholder='完整端点（默认勾选），如 https://api.anthropic.com/v1/messages。系统原样使用，不拼接路径。留空则不转发 Anthropic 协议请求';
-    oai.placeholder='完整端点（默认勾选），如 https://api.openai.com/v1/chat/completions。系统原样使用，不拼接路径。留空则不转发 OpenAI 协议请求';
-  }else{
-    anth.placeholder='base 路径，如 https://api.anthropic.com 或 https://api.anthropic.com/v1。系统自动拼接 /v1/messages。留空则不转发 Anthropic 协议请求';
-    oai.placeholder='base 路径，如 https://api.openai.com 或 https://api.openai.com/v1。系统自动拼接 /chat/completions。留空则不转发 OpenAI 协议请求';
-  }
-}
-function closeProviderModal(){document.getElementById('provider-modal').classList.remove('active');resetPasswordToggle('pf-key')}
-function togglePasswordVisibility(inputId,btn){
-  const input=document.getElementById(inputId);
-  const isPassword=input.type==='password';
-  input.type=isPassword?'text':'password';
-  btn.innerHTML=isPassword
-    ?'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg>'
-    :'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>';
-  btn.title=isPassword?'隐藏密钥':'显示/隐藏密钥';
-}
-function resetPasswordToggle(inputId){
-  const input=document.getElementById(inputId);
-  if(!input)return;
-  input.type='password';
-  const btn=document.getElementById(inputId+'-toggle');
-  if(btn){
-    btn.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>';
-    btn.title='显示/隐藏密钥';
-  }
-}
-function editProvider(p){openProviderModal(p)}
-async function saveProvider(){
-  const id=document.getElementById('provider-edit-id').value;
-  const data={
-    name:document.getElementById('pf-name').value,
-    anthropic_url:document.getElementById('pf-anthropic-url').value,
-    openai_url:document.getElementById('pf-openai-url').value,
-    api_key:document.getElementById('pf-key').value,
-    max_concurrency:parseInt(document.getElementById('pf-concurrency').value)||0,
-    full_path:document.getElementById('pf-full-path').checked?1:0,
-    enabled:document.getElementById('pf-enabled').checked,
-  };
-  if(id) await fetch(API+'/api/providers/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
-  else await(await fetch(API+'/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})).json();
-  closeProviderModal();loadProviders();
-}
-async function delProvider(id){if(!confirm('确定删除？关联的模型映射也会被删除。'))return;await fetch(API+'/api/providers/'+id,{method:'DELETE'});loadProviders();}
 
 // ---- Models ----
 function roleMapCell(m){
@@ -1311,15 +1163,6 @@ async function saveCleanupSettings(){
   loadCleanupSettings();
 }
 
-async function toggleProvider(id,enabled){
-  await fetch(API+'/api/providers/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
-  // 后端会级联更新该 provider 下所有 model_mappings 的 enabled，故同时刷新模型列表以保持 UI 与 DB 一致
-  loadProviders();
-  loadModels();
-  showFeatureToast(enabled?'已启用提供商':'已停用提供商', enabled
-    ? '该提供商下所有映射模型已同步置为<strong>启用</strong>。'
-    : '该提供商下所有映射模型已同步置为<strong>停用</strong>。');
-}
 async function toggleModel(id,enabled){
   const r=await fetch(API+'/api/models/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
   if(!r.ok){const j=await r.json().catch(()=>({}));showFeatureToast('开启失败',j.error||'操作失败');loadModels();return}
@@ -1362,7 +1205,7 @@ async function saveBillingPanel(){
     const method=hasBilling?'PUT':'POST';
     await fetch(API+'/api/providers/'+pid+'/billing',{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(bData)});
   }
-  closeBillingPanel();loadProviders();
+  closeBillingPanel();window.__reloadProviders?.();
 }
 function billingBarColor(pct){
   if(pct>=95)return 'full';if(pct>=80)return 'danger';if(pct>=60)return 'warn';return 'ok';
@@ -1564,38 +1407,8 @@ async function refreshVersionInfo(force){
 
 // Init
 initUrls();
-loadProviders();
 loadCleanupSettings();
 refreshVersionInfo(false);
-
-// 定时刷新并发状态（仅当提供商 tab 激活时）
-setInterval(()=>{
-  if(document.getElementById('panel-providers').classList.contains('active')){
-    fetch(API+'/api/concurrency').then(r=>r.json()).then(conc=>{
-      _concurrencyData=conc;
-      // 更新已有的并发条
-      document.querySelectorAll('.concurrency-bar').forEach(el=>{
-        const tr=el.closest('tr');
-        if(!tr) return;
-        // 从 providers 表找到对应 id
-        const delBtn=tr.querySelector('.btn-danger');
-        if(!delBtn) return;
-        const onclick=delBtn.getAttribute('onclick')||'';
-        const m=onclick.match(/delProvider\((\d+)\)/);
-        if(!m) return;
-        const pid=parseInt(m[1]);
-        const c=conc[pid];
-        if(!c) return;
-        const max=c.max||Infinity;
-        const pct=max===Infinity?0:Math.min(100,Math.round(c.used/c.max*100));
-        const cls=pct>=100?'full':pct>=70?'warn':'ok';
-        el.querySelector('.bar-fill').className='bar-fill '+cls;
-        el.querySelector('.bar-fill').style.width=pct+'%';
-        el.querySelector('.label').textContent=c.used+'/'+(max===Infinity?'∞':c.max);
-      });
-    }).catch(()=>{});
-  }
-},3000);
 
 // 定时刷新模型降级状态（仅当模型映射 tab 激活时）
 setInterval(()=>{
@@ -1606,5 +1419,6 @@ setInterval(()=>{
 </script>
 <script src="/static/js/panels/apikeys.js"></script>
 <script src="/static/js/panels/errors.js"></script>
+<script src="/static/js/panels/providers.js"></script>
 </body>
 </html>
