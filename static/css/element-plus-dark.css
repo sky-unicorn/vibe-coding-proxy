@@ -516,7 +516,7 @@
 .el-cascader__dropdown::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.25); }
 
 /* ---- logs 详情弹窗 ---- */
-.el-dialog.is-log-detail { max-height: 90vh; display: flex; flex-direction: column; max-width: 1200px; }
+.el-dialog.is-log-detail { height: 94vh; display: flex; flex-direction: column; max-width: 1200px; }
 .el-dialog.is-log-detail .el-dialog__body { flex: 1; min-height: 0; overflow: hidden; }
 /* 内层容器：flex 纵向，撑满 dialog body */
 .log-detail-inner { display: flex; flex-direction: column; height: 100%; }
@@ -526,8 +526,8 @@
 .log-detail-hint--warn strong { color: var(--warn, #f59e0b); }
 .log-detail-hint--error { background: rgba(239, 68, 68, .1); border: 1px solid rgba(239, 68, 68, .3); color: var(--text, #e4e4e7); }
 .log-detail-hint--error strong { color: var(--danger, #ef4444); }
-/* 左右双列 */
-.detail-columns { display: flex; gap: 12px; flex: 1; min-height: 0; height: calc(90vh - 220px); }
+/* 左右双列：去掉硬编码高度，由 flex:1 撑满弹窗 body，随视口动态伸缩 */
+.detail-columns { display: flex; gap: 12px; flex: 1; min-height: 0; }
 .detail-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .detail-col-label { font-size: 13px; font-weight: 600; color: var(--text, #e4e4e7); padding: 0 0 6px; border-bottom: 1px solid var(--border, #2a2d3a); margin-bottom: 8px; flex-shrink: 0; }
 .detail-col>.json-editor-wrap,

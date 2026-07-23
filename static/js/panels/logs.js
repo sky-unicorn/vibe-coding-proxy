@@ -94,7 +94,7 @@ if (window.Vue && window.ElementPlus) {
   </div>
 
   <!-- 日志详情弹窗 -->
-  <el-dialog v-model="detailVisible" title="请求详情" width="90vw" :close-on-click-modal="false" class="is-log-detail" @close="onDetailClose">
+  <el-dialog v-model="detailVisible" title="请求详情" width="90vw" align-center top="0" :close-on-click-modal="false" class="is-log-detail" @close="onDetailClose">
     <div class="log-detail-inner">
       <!-- 错误码映射提示 -->
       <div v-if="detailRow && detailRow.original_status_code && detailRow.mapped_status_code && detailRow.original_status_code!==detailRow.mapped_status_code"
@@ -470,6 +470,10 @@ if (window.Vue && window.ElementPlus) {
           this.tableMaxHeight = Math.max(240, window.innerHeight - el.getBoundingClientRect().top - below);
         });
       },
+      // ---- 详情弹窗内 jsoneditor 跟随视口重排 ----
+      resizeEditors(){
+        this._jsonEditors.forEach(ed=>{ try{ if(ed.aceEditor) ed.aceEditor.resize(); }catch(e){} });
+      },
     },
     mounted(){
       this.loadProviders();
@@ -478,6 +482,7 @@ if (window.Vue && window.ElementPlus) {
       // 表格高度按视口自适应
       this.resizeTable();
       window.addEventListener('resize', this.resizeTable);
+      window.addEventListener('resize', this.resizeEditors);
       // 跨面板桥接：供 switchTab 切到 logs 时刷新
       window.__reloadLogs = ()=>{ this.resizeTable(); this.load(); this.loadProviders(); this.loadCleanup(); };
     },
@@ -485,6 +490,7 @@ if (window.Vue && window.ElementPlus) {
       if(this._debounceTimer){ clearTimeout(this._debounceTimer); this._debounceTimer = null; }
       this.destroyEditors();
       window.removeEventListener('resize', this.resizeTable);
+      window.removeEventListener('resize', this.resizeEditors);
       if(window.__reloadLogs) delete window.__reloadLogs;
     },
   });
