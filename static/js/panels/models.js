@@ -184,6 +184,14 @@ if (window.Vue && window.ElementPlus) {
         <el-input-number v-model="degSettings.duration" :min="1" :controls="false" style="width:140px" />
         <span style="font-size:12px;color:var(--text2);margin-left:10px">单次降级时长</span>
       </el-form-item>
+      <el-form-item label="转发重试次数">
+        <el-input-number v-model="degSettings.retryCount" :min="0" :step="1" :controls="false" style="width:140px" />
+        <span style="font-size:12px;color:var(--text2);margin-left:10px">首次失败后最多再重试的次数（0=不重试）</span>
+      </el-form-item>
+      <el-form-item label="重试间隔秒数">
+        <el-input-number v-model="degSettings.retryDelay" :min="0" :step="0.5" :precision="1" :controls="false" style="width:140px" />
+        <span style="font-size:12px;color:var(--text2);margin-left:10px">两次重试之间的等待时间</span>
+      </el-form-item>
     </el-form>
     <template #footer>
       <el-button @click="dialogDeg=false">取消</el-button>
@@ -201,7 +209,7 @@ if (window.Vue && window.ElementPlus) {
         rows: [],
         providers: [],
         degData: {},
-        degSettings: { enabled:false, strict:false, duration:30 },
+        degSettings: { enabled:false, strict:false, duration:30, retryCount:3, retryDelay:1 },
         loading: false,
         dialogModel: false,
         dialogCodex: false,
@@ -265,6 +273,10 @@ if (window.Vue && window.ElementPlus) {
           this.degSettings.enabled = truthy(s.degradation_enabled);
           this.degSettings.strict = truthy(s.degradation_strict_priority);
           this.degSettings.duration = parseInt(s.degradation_duration)||30;
+          this.degSettings.retryCount = (parseInt(s.degradation_retry_count)>=0 && !isNaN(parseInt(s.degradation_retry_count)))
+            ? parseInt(s.degradation_retry_count) : 3;
+          this.degSettings.retryDelay = (parseFloat(s.degradation_retry_delay)>=0 && !isNaN(parseFloat(s.degradation_retry_delay)))
+            ? parseFloat(s.degradation_retry_delay) : 1;
           if(!this.degSettings.enabled) this.degSettings.strict = false;
         } catch(e) { /* 静默 */ }
       },
@@ -332,6 +344,8 @@ if (window.Vue && window.ElementPlus) {
             degradation_enabled: this.degSettings.enabled?'1':'0',
             degradation_strict_priority: this.degSettings.strict?'1':'0',
             degradation_duration: parseInt(this.degSettings.duration)||30,
+            degradation_retry_count: (parseInt(this.degSettings.retryCount)>=0 && !isNaN(parseInt(this.degSettings.retryCount)))?String(parseInt(this.degSettings.retryCount)):'3',
+            degradation_retry_delay: (parseFloat(this.degSettings.retryDelay)>=0 && !isNaN(parseFloat(this.degSettings.retryDelay)))?String(parseFloat(this.degSettings.retryDelay)):'1',
           })});
           ElementPlus.ElMessage.success('已保存');
           this.dialogDeg = false;

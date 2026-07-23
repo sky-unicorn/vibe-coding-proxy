@@ -30,8 +30,13 @@ _UPSTREAM_DONE = object()    # 上游流正常结束
 _UPSTREAM_ERROR = object()   # 上游读取异常（后跟 (exception,) 元组）
 
 
-def _post_with_retry(url, max_retries=_RETRY_MAX_ATTEMPTS, retry_delay=_RETRY_DELAY, retry_max_duration=_RETRY_MAX_DURATION, **kwargs):
+def _post_with_retry(url, max_retries=None, retry_delay=None, retry_max_duration=_RETRY_MAX_DURATION, **kwargs):
     """发起 HTTP POST 请求，仅对 5xx 和连接级异常按策略自动重试。
+
+    max_retries / retry_delay 默认 None：调用方未显式传入时，从降级配置
+    (config.get_degradation_config() 的 retry_count / retry_delay) 动态读取，
+    读不到时回退到模块常量 _RETRY_MAX_ATTEMPTS / _RETRY_DELAY。这样运行中
+    在 UI 改了重试次数/间隔后无需重启即可生效。
 
     重试触发条件（需同时满足）：
       1. 请求出错：连接级异常（DNS 失败 / 连接被上游中止 / 握手超时 / ChunkedEncodingError 等）
@@ -45,6 +50,16 @@ def _post_with_retry(url, max_retries=_RETRY_MAX_ATTEMPTS, retry_delay=_RETRY_DE
     该函数内部循环重试，仅返回最终结果（成功响应或最后一次的失败响应/异常），
     调用方在外层据此只记录一次日志——天然满足"只记录最后一次请求日志"。
     """
+    # 动态解析重试次数与间隔：未显式传入则取降级配置，再回退模块常量
+    if max_retries is None or retry_delay is None:
+        try:
+            _rc = config.get_degradation_config()
+        except Exception:
+            _rc = {}
+        if max_retries is None:
+            max_retries = _rc.get("retry_count", _RETRY_MAX_ATTEMPTS)
+        if retry_delay is None:
+            retry_delay = _rc.get("retry_delay", _RETRY_DELAY)
     last_err = None
     for attempt in range(max_retries + 1):
         start = time.time()
@@ -392,8 +407,8 @@ def get_concurrency_status():
 # ---- 服务降级状态管理 ----
 # 按 mapping_id（即 model_mappings 表的 id）粒度维护降级状态。
 # 同一 alias 下不同 provider/目标模型各自独立降级，避免一个故障上游牵连正常上游。
-# _post_with_retry 内部已做 3 次重试，调用方捕获到异常或收到错误响应时
-# 表示真正重试耗尽，直接 mark_degraded，无需额外累积计数。
+# _post_with_retry 内部已按降级配置做重试（默认 3 次，可在 UI 调整），调用方捕获到
+# 异常或收到错误响应时表示真正重试耗尽，直接 mark_degraded，无需额外累积计数。
 _degradation_lock = threading.Lock()
 _degradation_until = {}  # {mapping_id: degraded_until_timestamp}
 

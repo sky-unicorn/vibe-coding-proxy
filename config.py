@@ -1175,6 +1175,9 @@ def _create_latest_schema(conn):
         INSERT OR IGNORE INTO settings (key, value) VALUES ('last_cleanup_time', '');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('degradation_enabled', '0');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('degradation_duration', '30');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('degradation_strict_priority', '0');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('degradation_retry_count', '3');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('degradation_retry_delay', '1');
         CREATE TABLE IF NOT EXISTS provider_billing_config (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             provider_id INTEGER NOT NULL UNIQUE,
@@ -1941,8 +1944,10 @@ def get_degradation_config():
       - enabled: bool，是否启用降级（默认 False，需在 UI 主动打开）。
       - duration: int，单次降级持续秒数（默认 30，UI 可改）。
       - strict_priority: bool，是否启用严格优先级（逐级下放）模式（默认 False）。开启后仅在当前最高优先级层内选择候选，整层降级才下放到更低优先级层；依赖主降级开关 enabled=True 方可生效。
+      - retry_count: int，单次转发失败后最多再重试的次数（默认 3，UI 可改）。
+      - retry_delay: float，两次重试之间的间隔秒数（默认 1.0，UI 可改）。
 
-    降级语义：单次转发请求在 _post_with_retry 内部重试 3 次仍失败，
+    降级语义：单次转发请求在 _post_with_retry 内部重试 retry_count 次仍失败，
     即按具体 model_mapping（provider+目标模型）粒度标记降级，在 duration 秒内
     该候选不再被选中（除非全部候选都降级，则回退到原有加权轮询）。
     任意一次成功立即清除该候选的降级状态。
@@ -1950,16 +1955,32 @@ def get_degradation_config():
     enabled_raw = get_setting("degradation_enabled", "0")
     duration_raw = get_setting("degradation_duration", "30")
     strict_raw = get_setting("degradation_strict_priority", "0")
+    retry_count_raw = get_setting("degradation_retry_count", "3")
+    retry_delay_raw = get_setting("degradation_retry_delay", "1")
     try:
         duration = int(duration_raw)
     except (ValueError, TypeError):
         duration = 30
     if duration <= 0:
         duration = 30
+    try:
+        retry_count = int(retry_count_raw)
+    except (ValueError, TypeError):
+        retry_count = 3
+    if retry_count < 0:
+        retry_count = 3
+    try:
+        retry_delay = float(retry_delay_raw)
+    except (ValueError, TypeError):
+        retry_delay = 1.0
+    if retry_delay < 0:
+        retry_delay = 1.0
     return {
         "enabled": enabled_raw not in ("0", "false", "False", ""),
         "duration": duration,
         "strict_priority": strict_raw not in ("0", "false", "False", ""),
+        "retry_count": retry_count,
+        "retry_delay": retry_delay,
     }
 
 
@@ -2456,8 +2477,9 @@ def _migrate_degradation_settings(conn):
     """清理旧版降级配置的残留键，确保降级配置符合设计契约。
 
     旧版实现曾引入 degradation_failure_threshold 跨请求累积失败计数，
-    但最终设计不需要该字段（_post_with_retry 内部已做 3 次重试，出来即为最终失败）。
-    同时修正默认值：enabled 默认关闭（'0'），duration 默认 30 秒。
+    但最终设计不需要该字段（_post_with_retry 内部已做重试，出来即为最终失败）。
+    同时修正默认值：enabled 默认关闭（'0'），duration 默认 30 秒，
+    retry_count 默认 3 次，retry_delay 默认 1 秒。
     """
     # 删除不再使用的键
     conn.execute("DELETE FROM settings WHERE key='degradation_failure_threshold'")
@@ -2465,4 +2487,6 @@ def _migrate_degradation_settings(conn):
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('degradation_enabled', '0')")
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('degradation_duration', '30')")
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('degradation_strict_priority', '0')")
+    conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('degradation_retry_count', '3')")
+    conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('degradation_retry_delay', '1')")
     conn.commit()
