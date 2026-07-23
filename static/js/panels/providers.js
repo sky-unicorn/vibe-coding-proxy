@@ -278,15 +278,13 @@ if (window.Vue && window.ElementPlus) {
         window.editProviderBilling?.(id);
       },
       showEnabledToast(enabled){
-        ElementPlus.ElNotification({
-          title: enabled?'已启用提供商':'已停用提供商',
+        ElementPlus.ElMessage({
           message: enabled
-            ? '该提供商下所有映射模型已同步置为<strong>启用</strong>。'
-            : '该提供商下所有映射模型已同步置为<strong>停用</strong>。',
+            ? '已启用提供商：该提供商下所有映射模型已同步置为<strong>启用</strong>。'
+            : '已停用提供商：该提供商下所有映射模型已同步置为<strong>停用</strong>。',
           dangerouslyUseHTMLString: true,
           type: 'success',
           duration: 2000,
-          position: 'top-right',
         });
       },
     },
