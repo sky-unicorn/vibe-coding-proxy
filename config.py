@@ -1806,8 +1806,13 @@ def get_logs(page=1, per_page=50, status_filter=None, model_filter=None, ip_filt
     where = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
     total = conn.execute(f"SELECT COUNT(*) FROM logs {where}", params).fetchone()[0]
+    # 列表查询不带 request_body/response_body/error_msg 这三个大字段，
+    # 详情由 get_log(id) 按需单独拉取，避免列表一次性回传大量正文。
+    list_cols = ("id, request_time, provider, source_model, model, input_tokens, "
+                 "output_tokens, cache_read_input_tokens, cache_creation_input_tokens, "
+                 "status, duration_ms, original_status_code, mapped_status_code, client_ip")
     rows = conn.execute(
-        f"SELECT * FROM logs {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+        f"SELECT {list_cols} FROM logs {where} ORDER BY id DESC LIMIT ? OFFSET ?",
         params + [per_page, (page - 1) * per_page],
     ).fetchall()
     conn.close()
@@ -1817,6 +1822,14 @@ def get_logs(page=1, per_page=50, status_filter=None, model_filter=None, ip_filt
         "per_page": per_page,
         "logs": [dict(r) for r in rows],
     }
+
+
+def get_log(log_id):
+    """按 id 查询单条日志的完整字段（含 request_body/response_body/error_msg），供详情弹窗按需拉取。"""
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM logs WHERE id = ?", (log_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 def get_distinct_providers():

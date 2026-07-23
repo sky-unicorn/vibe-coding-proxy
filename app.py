@@ -410,6 +410,15 @@ def api_log_providers():
     return jsonify(config.get_distinct_providers())
 
 
+@app.route("/api/logs/<int:log_id>", methods=["GET"])
+def api_get_log(log_id):
+    """单条日志详情（含 request_body/response_body/error_msg），供详情弹窗按需拉取。"""
+    row = config.get_log(log_id)
+    if not row:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(row)
+
+
 @app.route("/api/logs", methods=["DELETE"])
 def api_clear_logs():
     config.clear_logs()

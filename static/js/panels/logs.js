@@ -252,15 +252,24 @@ if (window.Vue && window.ElementPlus) {
       },
 
       // ---- 日志详情 ----
-      openDetail(row){
+      async openDetail(row){
         // 先销毁旧实例，防止累积
         this.destroyEditors();
+        // 列表行只含元数据（不含 request_body/response_body/error_msg），先占位打开弹窗
         this.detailRow = row;
         this.detailVisible = true;
+        // 按需拉取完整详情（含正文），再渲染 jsoneditor
+        try {
+          const r = await fetch(API+'/api/logs/'+row.id);
+          if(r.ok){
+            this.detailRow = await r.json();
+          }
+        } catch(e) { /* 失败则保留列表行元数据，弹窗以空正文展示 */ }
         // 等 DOM 渲染后创建 jsoneditor
         this.$nextTick(()=>{
-          this.createEditor(this.reqEditorId, row.request_body);
-          this.createEditor(this.respEditorId, row.response_body);
+          const d = this.detailRow || {};
+          this.createEditor(this.reqEditorId, d.request_body);
+          this.createEditor(this.respEditorId, d.response_body);
         });
       },
       onDetailClose(){
