@@ -312,18 +312,7 @@ pre.mcp-code-block{background:var(--card);border:1px solid var(--border);border-
 
   <!-- 错误码映射 -->
   <div id="panel-errors" class="panel">
-    <div class="card">
-      <div class="card-header">
-        <h2>错误码映射</h2>
-        <button class="btn btn-primary" onclick="openErrorModal()">添加规则</button>
-      </div>
-      <p style="font-size:13px;color:var(--text2);margin-bottom:12px">将上游大模型返回的 HTTP 错误码映射为不同的错误码返回给 Claude Code。日志中记录原始错误码，Claude Code 收到映射后的错误码。可为每个提供商单独配置映射规则，留空表示全局规则。</p>
-      <table>
-        <thead><tr><th>提供商</th><th>原始错误码</th><th></th><th>映射为</th><th>状态</th><th>操作</th></tr></thead>
-        <tbody id="errors-tbody"></tbody>
-      </table>
-      <div id="errors-empty" class="empty" style="display:none">暂无映射规则，点击上方按钮添加</div>
-    </div>
+    <div id="vue-errors"></div>
   </div>
 
   <!-- 日志 -->
@@ -642,25 +631,6 @@ X-Nacos-Password = "你的Nacos密码"</pre>
   </div>
 </div>
 
-<!-- 错误码映射 Modal -->
-<div class="modal-overlay" id="error-modal">
-  <div class="modal" style="width:400px">
-    <h3 id="error-modal-title">添加错误码映射</h3>
-    <input type="hidden" id="error-edit-id">
-    <div class="form-group"><label>提供商</label><select id="ef-provider"><option value="">全局</option></select><span style="font-size:11px;color:var(--text2);margin-top:2px;display:block">选择具体提供商单独配置，或选"全局"作为通用规则</span></div>
-    <div class="form-group"><label>原始错误码（上游返回）</label><input id="ef-original" type="number" placeholder="如: 403" min="100" max="599"></div>
-    <div class="form-group"><label>映射为（返回给 Claude Code）</label><input id="ef-mapped" type="number" placeholder="如: 529" min="100" max="599"></div>
-    <div class="form-group" style="display:flex;align-items:center;gap:8px">
-      <label class="toggle"><input type="checkbox" id="ef-enabled" checked><span class="toggle-slider"></span></label>
-      <span style="font-size:13px">启用</span>
-    </div>
-    <div class="form-actions">
-      <button class="btn" style="background:var(--border);color:var(--text)" onclick="closeErrorModal()">取消</button>
-      <button class="btn btn-primary" onclick="saveError()">保存</button>
-    </div>
-  </div>
-</div>
-
 <!-- 日志详情 Modal -->
 <div class="modal-overlay" id="log-detail-modal">
   <div class="modal" style="width:90vw;max-width:1200px">
@@ -729,7 +699,6 @@ function switchTab(name){
   if(location.hash!=='#'+name) history.replaceState(null,'','#'+name);
   if(name==='providers') loadProviders();
   if(name==='models'){loadDegradationSettings();loadModels();}
-  if(name==='errors') loadErrors();
   if(name==='logs'){loadLogProviders();loadLogs();loadCleanupSettings();}
   if(name==='billing') loadBillingOverview();
   if(name==='mcp') updateMcpUrl();
@@ -1342,56 +1311,6 @@ async function saveCleanupSettings(){
   loadCleanupSettings();
 }
 
-// ---- Error Mappings ----
-async function loadErrorProviders(){
-  const sel=document.getElementById('ef-provider');
-  const providers=await(await fetch(API+'/api/providers')).json();
-  sel.innerHTML='<option value="">全局</option>'+providers.filter(p=>p.enabled).map(p=>`<option value="${esc(p.name)}">${esc(p.name)}</option>`).join('');
-}
-async function loadErrors(){
-  const r=await(await fetch(API+'/api/error-mappings')).json();
-  const tb=document.getElementById('errors-tbody');
-  const empty=document.getElementById('errors-empty');
-  if(!r.length){tb.innerHTML='';empty.style.display='';return}
-  empty.style.display='none';
-  tb.innerHTML=r.map(e=>`<tr>
-    <td><span class="badge" style="font-size:12px;background:var(--border);color:var(--text)">${e.provider||'全局'}</span></td>
-    <td><span class="badge badge-error" style="font-size:14px;font-weight:700">${e.original_code}</span></td>
-    <td><span class="arrow-icon">&rarr;</span></td>
-    <td><span class="badge badge-warn" style="font-size:14px;font-weight:700">${e.mapped_code}</span></td>
-    <td style="white-space:nowrap"><label class="toggle" title="${e.enabled?'点击禁用':'点击启用'}"><input type="checkbox" ${e.enabled?'checked':''} onchange="toggleError(${e.id},this.checked)"><span class="toggle-slider"></span></label> <span class="badge ${e.enabled?'badge-success':'badge-error'}" style="margin-left:4px">${e.enabled?'启用':'禁用'}</span></td>
-    <td>
-      <button class="btn btn-sm" style="background:var(--border);color:var(--text)" onclick="editError(_dataStore.errors[${_store('errors',e)}])">编辑</button>
-      <button class="btn btn-danger btn-sm" onclick="delError(${e.id})">删除</button>
-    </td>
-  </tr>`).join('');
-}
-async function openErrorModal(e){
-  await loadErrorProviders();
-  document.getElementById('error-modal-title').textContent=e?'编辑错误码映射':'添加错误码映射';
-  document.getElementById('error-edit-id').value=e?e.id:'';
-  document.getElementById('ef-original').value=e?e.original_code:'';
-  document.getElementById('ef-mapped').value=e?e.mapped_code:'';
-  document.getElementById('ef-enabled').checked=e?e.enabled:true;
-  document.getElementById('ef-provider').value=e?e.provider:'';
-  document.getElementById('error-modal').classList.add('active');
-}
-function closeErrorModal(){document.getElementById('error-modal').classList.remove('active')}
-function editError(e){openErrorModal(e)}
-async function saveError(){
-  const id=document.getElementById('error-edit-id').value;
-  const data={
-    provider:document.getElementById('ef-provider').value,
-    original_code:parseInt(document.getElementById('ef-original').value),
-    mapped_code:parseInt(document.getElementById('ef-mapped').value),
-    enabled:document.getElementById('ef-enabled').checked,
-  };
-  if(id) await fetch(API+'/api/error-mappings/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
-  else await fetch(API+'/api/error-mappings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
-  closeErrorModal();loadErrors();
-}
-async function delError(id){if(!confirm('确定删除？'))return;await fetch(API+'/api/error-mappings/'+id,{method:'DELETE'});loadErrors();}
-
 async function toggleProvider(id,enabled){
   await fetch(API+'/api/providers/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
   // 后端会级联更新该 provider 下所有 model_mappings 的 enabled，故同时刷新模型列表以保持 UI 与 DB 一致
@@ -1406,7 +1325,6 @@ async function toggleModel(id,enabled){
   if(!r.ok){const j=await r.json().catch(()=>({}));showFeatureToast('开启失败',j.error||'操作失败');loadModels();return}
   loadModels()
 }
-async function toggleError(id,enabled){await fetch(API+'/api/error-mappings/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});loadErrors()}
 
 // ---- Billing ----
 function billingModeLabel(m){
@@ -1687,5 +1605,6 @@ setInterval(()=>{
 },3000);
 </script>
 <script src="/static/js/panels/apikeys.js"></script>
+<script src="/static/js/panels/errors.js"></script>
 </body>
 </html>
