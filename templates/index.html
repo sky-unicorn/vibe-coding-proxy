@@ -174,6 +174,9 @@ tr[data-alias]{background:rgba(var(--alias-rgb),.07)}
 tr[data-alias]:hover{background:rgba(var(--alias-rgb),.14)}
 .alias-badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:500;background:rgba(var(--alias-rgb),.2);color:rgb(var(--alias-rgb));gap:6px}
 .alias-color-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:rgb(var(--alias-rgb));flex-shrink:0}
+/* el-table 别名分组行底色（models 面板）：单元格透明，行底色由 row-style 在 tr 注入 --alias-rgb */
+#vue-models .el-table__row>td.el-table__cell{background-color:transparent!important}
+#vue-models .el-table__body tr.el-table__row:hover,#vue-models .el-table__body tr.el-table__row.hover-row{background-color:rgba(var(--alias-rgb),.14)!important}
 /* 功能提示框（居中浮层） */
 .feature-toast{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:var(--card);border:1px solid var(--border);border-radius:12px;padding:24px 28px;width:440px;max-width:90vw;z-index:200;box-shadow:0 8px 32px rgba(0,0,0,.5);animation:toastFadeIn .25s ease}
 .feature-toast.closing{animation:toastFadeOut .2s ease forwards}
@@ -271,33 +274,7 @@ pre.mcp-code-block{background:var(--card);border:1px solid var(--border);border-
 
   <!-- 模型映射 -->
   <div id="panel-models" class="panel">
-    <div class="card">
-      <div class="card-header">
-        <h2>模型映射</h2>
-        <button class="btn btn-primary" onclick="openModelModal()">添加映射</button>
-      </div>
-      <p style="font-size:13px;color:var(--text2);margin-bottom:12px">将请求中的模型名（别名）映射到实际的模型和提供商。同一别名可配置多条映射，系统按优先级加权轮询，并自动选并发最低的提供商。</p>
-      <div class="degradation-bar">
-        <div class="item">
-          <label class="toggle"><input type="checkbox" id="degradation-enabled"><span class="toggle-slider"></span></label>
-          <span>启用服务降级</span>
-        </div>
-        <div class="item">
-          <label class="toggle"><input type="checkbox" id="degradation-strict"><span class="toggle-slider"></span></label>
-          <span>严格优先级（逐级下放）</span>
-        </div>
-        <div class="item">
-          降级持续 <input type="number" id="degradation-duration" value="30" min="1"> 秒
-        </div>
-        <button class="btn btn-primary btn-sm" onclick="saveDegradationSettings()">保存设置</button>
-        <span id="degradation-info" class="save-info"></span>
-      </div>
-      <table>
-        <thead><tr><th>别名</th><th>优先级</th><th>目标模型</th><th>模型类型</th><th>最大输出 Token 数</th><th>提供商</th><th>角色映射</th><th>降级状态</th><th>状态</th><th>操作</th></tr></thead>
-        <tbody id="models-tbody"></tbody>
-      </table>
-      <div id="models-empty" class="empty" style="display:none">暂无映射，点击上方按钮添加</div>
-    </div>
+    <div id="vue-models"></div>
   </div>
 
   <!-- 错误码映射 -->
@@ -505,96 +482,6 @@ X-Nacos-Password = "你的Nacos密码"</pre>
   </div>
 </div>
 
-<!-- 模型映射 Modal -->
-<div class="modal-overlay" id="model-modal">
-  <div class="modal">
-    <h3 id="model-modal-title">添加映射</h3>
-    <input type="hidden" id="model-edit-id">
-    <div class="form-group"><label>别名（对外模型名，多条同名则按优先级加权轮询）</label><input id="mf-alias" placeholder="如: claude-sonnet-4-20250514"></div>
-    <div class="form-group"><label>优先级（数值越小优先级越高）</label><input id="mf-priority" type="number" min="1" value="1" placeholder="1"><span style="font-size:11px;color:var(--text2);margin-top:2px;display:block">同一别名下，优先级高的模型获得更多流量，但所有模型都会被使用</span></div>
-    <div class="form-group"><label>目标模型</label><input id="mf-target" placeholder="如: claude-sonnet-4-20250514 或 gpt-4o"></div>
-    <div class="form-group"><label>模型类型</label><select id="mf-model-type"><option value="text">文本模型</option><option value="multimodal">多模态模型</option></select><span style="font-size:11px;color:var(--text2);margin-top:2px;display:block">多模态模型会保留图片内容，文本模型会自动移除图片</span></div>
-    <div class="form-group"><label>最大输出 Token 数</label><input id="mf-max-tokens" type="number" min="0" value="0" placeholder="0"><span style="font-size:11px;color:var(--text2);margin-top:2px;display:block">替换调用方传入的最大输出 token 数，若调用方原值上游能正常处理，留 0 或空即可。当调用方传入超限上游报错时才需配置：如模型kimi-2.7上限 32768，调用方却传 64000 导致报错，则填 32768</span></div>
-    <div class="form-group"><label>提供商</label><select id="mf-provider" onchange="syncModelEnabledLock()"></select></div>
-    <div class="form-group" style="display:flex;align-items:center;gap:8px">
-      <label class="toggle"><input type="checkbox" id="mf-enabled" checked><span class="toggle-slider"></span></label>
-      <span id="mf-enabled-label" style="font-size:13px">启用</span>
-    </div>
-    <div class="form-actions">
-      <button class="btn" style="background:var(--border);color:var(--text)" onclick="closeModelModal()">取消</button>
-      <button class="btn btn-primary" onclick="saveModel()">保存</button>
-    </div>
-  </div>
-</div>
-
-<!-- Codex 配置 Modal（独立弹窗，管理 Responses->Chat 转换的思考相关开关） -->
-<div class="modal-overlay" id="codex-config-modal">
-  <div class="modal" style="width:520px">
-    <h3>Codex 配置</h3>
-    <input type="hidden" id="cf-mapping-id">
-    <p style="font-size:12px;color:var(--text2);margin-bottom:16px">仅作用于 codex CLI 走的 Responses->Chat 转换路径（Claude Code 走 Anthropic 直转不受影响）。</p>
-
-    <!-- 透传思考强度参数 -->
-    <div class="form-group" style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-      <label class="toggle"><input type="checkbox" id="cf-reasoning" checked><span class="toggle-slider"></span></label>
-      <span style="font-size:13px">透传思考强度参数（<code>reasoning_effort</code>）</span>
-    </div>
-    <div style="font-size:11px;color:var(--text2);margin-top:-4px;margin-bottom:16px">
-      开启后，调用方传来的思考强度（如 codex 的 <code>reasoning_effort=high</code>）作为 <code>reasoning_effort</code> 原值透传给上游；关闭则保守跳过（不发该字段）。<b>兼容性参考</b>：GLM/DeepSeek 原生认此字段；MiniMax 接受但不调深度；火山/讯飞/Kimi 参数名不同，传过去多半被忽略（不报错）。默认开启，若实测出现 400 再关闭。值 <code>low/medium/high</code> 不做翻译。
-    </div>
-
-    <!-- 思考过程注入：<think> 标签 -->
-    <div class="form-group" style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-      <label class="toggle"><input type="checkbox" id="cf-think" onchange="if(this.checked){document.getElementById('cf-reasoning-field').checked=false;document.getElementById('cf-native-responses').checked=false;}"><span class="toggle-slider"></span></label>
-      <span style="font-size:13px">思考过程注入：<code>&lt;think&gt;</code> 标签</span>
-    </div>
-    <div style="font-size:11px;color:var(--text2);margin-top:-4px;margin-bottom:8px">
-      将 codex 回传的历史 reasoning 以 <code>&lt;think&gt;...&lt;/think&gt;</code> 标签注入 assistant 消息 content。<b>适用</b>：MiniMax-M3（Interleaved Thinking，多轮工具调用必需）。默认关闭。
-    </div>
-
-    <!-- 思考过程注入：reasoning_content 字段 -->
-    <div class="form-group" style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-      <label class="toggle"><input type="checkbox" id="cf-reasoning-field" checked onchange="if(this.checked){document.getElementById('cf-think').checked=false;document.getElementById('cf-native-responses').checked=false;}"><span class="toggle-slider"></span></label>
-      <span style="font-size:13px">思考过程注入：<code>reasoning_content</code> 字段</span>
-    </div>
-    <div style="font-size:11px;color:var(--text2);margin-top:-4px;margin-bottom:8px">
-      将 codex 回传的历史 reasoning 以独立 <code>reasoning_content</code> 字段注入 assistant 消息。<b>适用</b>：DeepSeek/GLM/Kimi 思考模式原生字段（多轮工具调用必需，缺失会 400）。默认开启。
-    </div>
-
-    <!-- 原生 Responses 透传 -->
-    <div class="form-group" style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-      <label class="toggle"><input type="checkbox" id="cf-native-responses"
-        onchange="if(this.checked){document.getElementById('cf-think').checked=false;document.getElementById('cf-reasoning-field').checked=false;}">
-        <span class="toggle-slider"></span></label>
-      <span style="font-size:13px">模型原生支持 Responses 协议（透传，跳过 Responses↔Chat 转换）</span>
-    </div>
-    <div style="font-size:11px;color:var(--text2);margin-top:-4px;margin-bottom:16px">
-      开启后，<code>/openai</code> 端点对该 mapping 不做 Responses↔Chat 双向转换，直接按 <code>provider.openai_url</code> 派生 <code>/responses</code> 端点原样转发（仿 Anthropic handler 直转语义）。<b>适用上游</b>：原生支持 Responses API 的 OpenAI 兼容端点；其余上游（仅暴露 <code>/chat/completions</code>）开启后会被 fallback 兜底。开启时，上方两个"思考过程注入"开关自动关闭、三方互斥。默认关闭。
-    </div>
-
-    <div class="form-actions">
-      <button class="btn" style="background:var(--border);color:var(--text)" onclick="closeCodexConfigModal()">取消</button>
-      <button class="btn btn-primary" onclick="saveCodexConfig()">保存</button>
-    </div>
-  </div>
-</div>
-
-<!-- 角色映射 Modal（独立弹窗，支持多条规则） -->
-<div class="modal-overlay" id="role-map-modal">
-  <div class="modal" style="width:500px">
-    <h3>角色映射</h3>
-    <input type="hidden" id="rm-mapping-id">
-    <div class="rm-tip">将请求中指定角色的消息替换为目标角色，仅对当前提供商的当前模型生效。例如：部分上游不支持 <code>developer</code> 角色，可映射为 <code>system</code>。</div>
-    <div id="rm-rules-list" class="rm-rules-list"></div>
-    <div id="rm-empty" class="rm-empty" style="display:none">暂无映射规则，点击下方按钮添加一条</div>
-    <button class="btn btn-sm rm-add" onclick="addRoleMapRow()">+ 添加规则</button>
-    <div class="form-actions" style="margin-top:18px">
-      <button class="btn" style="background:var(--border);color:var(--text)" onclick="closeRoleMapModal()">取消</button>
-      <button class="btn btn-primary" onclick="saveRoleMap()">保存</button>
-    </div>
-  </div>
-</div>
-
 <!-- 日志详情 Modal -->
 <div class="modal-overlay" id="log-detail-modal">
   <div class="modal" style="width:90vw;max-width:1200px">
@@ -662,7 +549,7 @@ function switchTab(name){
   document.getElementById('panel-'+name).classList.add('active');
   if(location.hash!=='#'+name) history.replaceState(null,'','#'+name);
   if(name==='providers') window.__reloadProviders?.();
-  if(name==='models'){loadDegradationSettings();loadModels();}
+  if(name==='models'){window.__reloadModels?.();}
   if(name==='logs'){loadLogProviders();loadLogs();loadCleanupSettings();}
   if(name==='billing') loadBillingOverview();
   if(name==='mcp') updateMcpUrl();
@@ -673,120 +560,7 @@ window.addEventListener('DOMContentLoaded',()=>{
   if(valid.includes(h)) switchTab(h);
 });
 
-// ---- Models ----
-function roleMapCell(m){
-  let rules=[];
-  if(m.role_mappings){
-    try{rules=JSON.parse(m.role_mappings);}catch(e){rules=[];}
-  }
-  if(!Array.isArray(rules)||!rules.length) return '<span style="color:var(--text2)">-</span>';
-  return rules.map(r=>`<code style="background:rgba(99,102,241,.15);color:#6366f1;margin-right:4px">${esc(r.from||'')}&rarr;${esc(r.to||'')}</code>`).join('');
-}
-const ALIAS_PALETTE=[
-  '99,102,241','16,185,129','245,158,11','239,68,68','59,130,246','217,70,239',
-  '20,184,166','251,146,60','96,165,250','192,132,252','52,211,153','253,186,116',
-];
-function _aliasColor(idx){return ALIAS_PALETTE[idx%ALIAS_PALETTE.length];}
-// 降级状态缓存：mapping_id -> {degraded, remaining}（后端按 mapping_id 索引）
-let _degradationData={};
-function parseDegradation(resp){
-  // 后端返回 {mapping_id: {degraded, remaining}}；统一归一为 key->obj，key 为字符串
-  const out={};
-  if(!resp)return out;
-  if(Array.isArray(resp)){
-    for(const d of resp){
-      const key=d.id!=null?d.id:(d.alias||d.model);
-      if(key!=null)out[String(key)]=d;
-    }
-    return out;
-  }
-  if(typeof resp==='object'){
-    for(const k of Object.keys(resp)){
-      out[String(k)]=resp[k];
-    }
-  }
-  return out;
-}
-function degradationCell(key){
-  const d=_degradationData[key];
-  if(!d||!d.degraded)return '<span class="badge badge-success">正常</span>';
-  const remaining=d.remaining!=null?Math.max(0,Math.round(d.remaining)):0;
-  return `<span class="badge badge-degrade" data-deg-key="${esc(key)}" data-deg-remaining="${remaining}">降级（剩余 ${remaining}s）</span>`;
-}
-async function loadModels(){
-  const [models,providers,degRaw]=await Promise.all([
-    fetch(API+'/api/models').then(r=>r.json()),
-    fetch(API+'/api/providers').then(r=>r.json()),
-    fetch(API+'/api/models/degradation').then(r=>r.json()).catch(()=>null),
-  ]);
-  _degradationData=parseDegradation(degRaw);
-  const tb=document.getElementById('models-tbody');
-  const empty=document.getElementById('models-empty');
-  if(!models.length){tb.innerHTML='';empty.style.display='';return}
-  empty.style.display='none';
-
-  // 按别名分桶：同名别名 = 负载均衡池
-  const byAlias = Object.create(null);
-  for (const m of models) {
-    const k = m.alias || '';
-    if (!byAlias[k]) byAlias[k] = [];
-    byAlias[k].push(m);
-  }
-  let colorIdx=0;
-  let rows='';
-  for(const aliasName of Object.keys(byAlias).sort()){
-    const color=_aliasColor(colorIdx++);
-    const pool=byAlias[aliasName].sort((a,b)=>(a.priority||1)-(b.priority||1)||a.id-b.id);
-    for(const m of pool){
-      // 降级状态查询键：后端按 mapping_id（即 m.id）返回，每行独立
-      const degKey=String(m.id);
-      // 所属 provider 是否被禁用：禁用时锁定 toggle、不允许开启（与后端拦截语义一致）
-      const provDisabled=!m.provider_enabled||Number(m.provider_enabled)===0;
-      rows+=`<tr data-alias="${esc(aliasName)}" style="--alias-rgb:${color}">
-        <td><span class="alias-badge" style="--alias-rgb:${color}"><span class="alias-color-dot"></span>${esc(m.alias)}</span></td>
-        <td>${m.priority!=null?`<span class="badge" style="background:rgba(${color},.35);color:rgb(${color})">${m.priority}</span>`:'<span style="color:var(--text2)">1</span>'}</td>
-        <td><code>${esc(m.target_model)}</code></td>
-        <td>${m.model_type==='multimodal'?'<span class="badge" style="background:#6366f1;color:#fff">多模态</span>':'<span class="badge" style="background:var(--border);color:var(--text)">文本</span>'}</td>
-        <td>${m.max_tokens>0?`<code>${m.max_tokens}</code>`:'<span style="color:var(--text2)">默认</span>'}</td>
-        <td>${esc(m.provider_name||'未知')}${provDisabled?' <span class="badge badge-error" style="font-size:10px;padding:1px 5px">提供商已禁用</span>':''}</td>
-        <td>${roleMapCell(m)}</td>
-        <td style="white-space:nowrap" data-deg-cell="${esc(degKey)}">${degradationCell(degKey)}</td>
-        <td style="white-space:nowrap"><label class="toggle ${provDisabled?'toggle-locked':''}" title="${provDisabled?'提供商已禁用，请先启用提供商':(m.enabled?'点击禁用':'点击启用')}"><input type="checkbox" ${m.enabled?'checked':''} ${provDisabled?'disabled':''} onchange="toggleModel(${m.id},this.checked)"><span class="toggle-slider"></span></label> <span class="badge ${m.enabled?'badge-success':'badge-error'}" style="margin-left:4px">${m.enabled?'启用':'禁用'}</span></td>
-        <td>
-          <button class="btn btn-sm" style="background:var(--border);color:var(--text)" onclick="editModel(_dataStore.models[${_store('models',m)}])">编辑</button>
-          <button class="btn btn-sm" style="background:rgba(16,185,129,.15);color:#10b981" onclick="openCodexConfigModal(_dataStore.models[${_store('models',m)}])">Codex配置</button>
-          <button class="btn btn-sm" style="background:rgba(99,102,241,.15);color:#6366f1" onclick="openRoleMapModal(_dataStore.models[${_store('models',m)}])">角色映射</button>
-          <button class="btn btn-danger btn-sm" onclick="delModel(${m.id})">删除</button>
-        </td>
-      </tr>`;
-    }
-  }
-  tb.innerHTML=rows;
-}
-async function loadDegradationSettings(){
-  try{
-    const s=await(await fetch(API+'/api/settings')).json();
-    const en=s.degradation_enabled;
-    document.getElementById('degradation-enabled').checked= en==='1'||en===1||en===true||String(en).toLowerCase()==='true';
-    document.getElementById('degradation-duration').value=s.degradation_duration||30;
-    const sp=s.degradation_strict_priority;
-    document.getElementById('degradation-strict').checked= sp==='1'||sp===1||sp===true||String(sp).toLowerCase()==='true';
-    document.getElementById('degradation-strict').disabled=!document.getElementById('degradation-enabled').checked;
-  }catch(e){}
-}
-async function saveDegradationSettings(){
-  const data={
-    degradation_enabled:document.getElementById('degradation-enabled').checked?'1':'0',
-    degradation_strict_priority:document.getElementById('degradation-strict').checked?'1':'0',
-    degradation_duration:parseInt(document.getElementById('degradation-duration').value)||30,
-  };
-  try{
-    await fetch(API+'/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
-    const info=document.getElementById('degradation-info');
-    if(info){info.textContent='已保存';setTimeout(()=>{if(info)info.textContent=''},2000);}
-    refreshDegradation();
-  }catch(e){alert('保存失败');}
-}
+// ---- Models（已迁移为 Vue 岛屿 static/js/panels/models.js，保留 showFeatureToast 供降级开关/复制等复用）----
 // 功能提示框：开关打开时弹出说明，2秒自动关闭，关闭不改变开关状态
 let _featureToastTimer=null;
 function showFeatureToast(title,bodyHtml){
@@ -813,158 +587,6 @@ function closeFeatureToast(){
   if(_featureToastTimer){clearTimeout(_featureToastTimer);_featureToastTimer=null;}
   toast.classList.add('closing');
   setTimeout(()=>{const t=document.getElementById('feature-toast');if(t)t.remove();},200);
-}
-document.getElementById('degradation-enabled').addEventListener('change',function(){
-  document.getElementById('degradation-strict').disabled=!this.checked;
-  if(!this.checked){document.getElementById('degradation-strict').checked=false;}
-  else{
-    showFeatureToast('启用服务降级',
-      '开启后，当某个模型映射对应的提供商持续返回错误（如 429 限流、5xx）时，系统会自动将该映射临时标记为<strong>降级</strong>状态，并在设定的<strong>降级持续秒数</strong>内跳过它、优先调用同一别名下的其他提供商，避免反复打到坏掉的上游。<br><br><strong>适用场景</strong>：同一别名配置了多个提供商做负载均衡，希望某个上游出故障时自动切到其他可用上游，而不是逐个失败重试。若每个别名只有一个提供商，开启降级意义不大。');
-  }
-});
-document.getElementById('degradation-strict').addEventListener('change',function(){
-  if(this.checked){
-    showFeatureToast('严格优先级（逐级下放）',
-      '关闭（默认）时，系统在同一别名的<strong>所有优先级层</strong>之间<strong>加权轮询</strong>——优先级高的层获得更多流量，但低优先级层也会被使用。<br><br>开启<strong>严格优先级</strong>后，系统<strong>仅在当前可用的最高优先级层</strong>内选择；只有当整个高优先级层都已降级（全部提供商故障）时，才会<strong>逐级下放</strong>到下一优先级层。<br><br><strong>适用场景</strong>：希望主力模型优先用满、省钱模型只在主力全部不可用时才兜底；或不同优先级对应不同价位/质量，希望严格按层级使用，不愿低优先级分走流量。');
-  }
-});
-async function refreshDegradation(){
-  try{
-    const degRaw=await(await fetch(API+'/api/models/degradation')).json();
-    _degradationData=parseDegradation(degRaw);
-    // 按 mapping_id（data-deg-cell）就地刷新降级状态单元格，避免整表重渲染
-    document.querySelectorAll('#models-tbody td[data-deg-cell]').forEach(cell=>{
-      const key=cell.getAttribute('data-deg-cell');
-      cell.innerHTML=degradationCell(key);
-    });
-  }catch(e){}
-}
-async function openModelModal(m){
-  const providers=await(await fetch(API+'/api/providers')).json();
-  document.getElementById('mf-provider').innerHTML=providers.map(p=>`<option value="${p.id}" data-enabled="${p.enabled?1:0}">${esc(p.name)}${formatProviderProtocols(p)}</option>`).join('');
-  document.getElementById('model-modal-title').textContent=m?'编辑映射':'添加映射';
-  document.getElementById('model-edit-id').value=m?m.id:'';
-  document.getElementById('mf-alias').value=m?m.alias:'';
-  document.getElementById('mf-priority').value=m?m.priority:1;
-  document.getElementById('mf-target').value=m?m.target_model:'';
-  document.getElementById('mf-model-type').value=m?m.model_type:'text';
-  document.getElementById('mf-max-tokens').value=m?m.max_tokens:0;
-  document.getElementById('mf-provider').value=m?m.provider_id:(providers[0]?.id||'');
-  document.getElementById('mf-enabled').checked=m?m.enabled:true;
-  syncModelEnabledLock();
-  document.getElementById('model-modal').classList.add('active');
-}
-// 根据当前所选提供商的启停状态，联动锁定/解锁「启用」开关。
-// provider 禁用时，其下 mapping 一律不能为启用态（与列表 toggle 锁定、后端拦截语义一致）。
-function syncModelEnabledLock(){
-  const sel=document.getElementById('mf-provider');
-  const opt=sel.options[sel.selectedIndex];
-  if(!opt) return;
-  const provEnabled=opt.dataset.enabled!=='0';
-  const en=document.getElementById('mf-enabled');
-  const lbl=document.getElementById('mf-enabled-label');
-  const toggle=en.closest('.toggle');
-  if(provEnabled){
-    en.disabled=false;
-    toggle.classList.remove('toggle-locked');
-    lbl.textContent='启用';
-    lbl.style.color='';
-  }else{
-    en.disabled=true;
-    en.checked=false;
-    toggle.classList.add('toggle-locked');
-    lbl.textContent='启用（提供商已禁用，请先启用提供商）';
-    lbl.style.color='#f59e0b';
-  }
-}
-function closeModelModal(){document.getElementById('model-modal').classList.remove('active')}
-function editModel(m){openModelModal(m)}
-async function saveModel(){
-  const id=document.getElementById('model-edit-id').value;
-  const data={
-    alias:document.getElementById('mf-alias').value,
-    priority:parseInt(document.getElementById('mf-priority').value)||1,
-    target_model:document.getElementById('mf-target').value,
-    model_type:document.getElementById('mf-model-type').value,
-    max_tokens:parseInt(document.getElementById('mf-max-tokens').value)||0,
-    provider_id:parseInt(document.getElementById('mf-provider').value),
-    enabled:document.getElementById('mf-enabled').checked,
-  };
-  if(id){const r=await fetch(API+'/api/models/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});if(!r.ok){const j=await r.json().catch(()=>({}));showFeatureToast('保存失败',j.error||'操作失败');return}}
-  else await fetch(API+'/api/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
-  closeModelModal();loadModels();
-}
-async function delModel(id){if(!confirm('确定删除？'))return;await fetch(API+'/api/models/'+id,{method:'DELETE'});loadModels();}
-
-// Codex 配置弹窗（管理 Responses->Chat 转换的思考相关开关）
-function openCodexConfigModal(m){
-  document.getElementById('cf-mapping-id').value=m?m.id:'';
-  document.getElementById('cf-reasoning').checked=m?!!m.reasoning_effort_supported:true;
-  document.getElementById('cf-think').checked=m?!!m.think_injection:false;
-  document.getElementById('cf-reasoning-field').checked=m?!!m.reasoning_content_field:true;
-  document.getElementById('cf-native-responses').checked=m?!!m.native_responses:false;
-  // 三方互斥由各开关的 onchange 强制保证（开任一自动取消另两个），无需额外 disabled 逻辑
-  document.getElementById('codex-config-modal').classList.add('active');
-}
-function closeCodexConfigModal(){document.getElementById('codex-config-modal').classList.remove('active')}
-async function saveCodexConfig(){
-  const id=document.getElementById('cf-mapping-id').value;
-  if(!id)return;
-  const data={
-    reasoning_effort_supported:document.getElementById('cf-reasoning').checked,
-    think_injection:document.getElementById('cf-think').checked,
-    reasoning_content_field:document.getElementById('cf-reasoning-field').checked,
-    native_responses:document.getElementById('cf-native-responses').checked,
-  };
-  await fetch(API+'/api/models/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
-  closeCodexConfigModal();loadModels();
-}
-
-// 角色映射弹窗（支持多条规则）
-function openRoleMapModal(m){
-  document.getElementById('rm-mapping-id').value=m?m.id:'';
-  let rules=[];
-  if(m&&m.role_mappings){try{rules=JSON.parse(m.role_mappings);}catch(e){rules=[];}}
-  if(!Array.isArray(rules))rules=[];
-  const list=document.getElementById('rm-rules-list');
-  list.innerHTML='';
-  if(!rules.length)rules=[{from:'',to:''}];
-  rules.forEach(r=>addRoleMapRow(r.from||'',r.to||''));
-  refreshRmEmpty();
-  document.getElementById('role-map-modal').classList.add('active');
-}
-function closeRoleMapModal(){document.getElementById('role-map-modal').classList.remove('active')}
-function refreshRmEmpty(){
-  const list=document.getElementById('rm-rules-list');
-  document.getElementById('rm-empty').style.display=list.children.length?'none':'block';
-}
-function addRoleMapRow(from,to){
-  from=from||'';to=to||'';
-  const div=document.createElement('div');
-  div.className='rm-row';
-  div.innerHTML='<input class="rm-from" placeholder="原角色（如 developer）" value="'+esc(from)+'">'+
-    '<span class="rm-arrow">&rarr;</span>'+
-    '<input class="rm-to" placeholder="目标角色（如 system）" value="'+esc(to)+'">'+
-    '<button class="btn btn-sm btn-danger rm-del" type="button" onclick="removeRoleMapRow(this)">✕</button>';
-  document.getElementById('rm-rules-list').appendChild(div);
-  refreshRmEmpty();
-}
-function removeRoleMapRow(btn){
-  btn.parentElement.remove();
-  refreshRmEmpty();
-}
-async function saveRoleMap(){
-  const id=document.getElementById('rm-mapping-id').value;
-  if(!id)return;
-  const rows=document.querySelectorAll('#rm-rules-list > div');
-  const rules=[];
-  rows.forEach(row=>{
-    const f=row.querySelector('.rm-from').value.trim();
-    const t=row.querySelector('.rm-to').value.trim();
-    if(f&&t)rules.push({from:f,to:t});
-  });
-  await fetch(API+'/api/models/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({role_mappings:rules})});
-  closeRoleMapModal();loadModels();
 }
 
 // ---- Logs ----
@@ -1161,12 +783,6 @@ async function saveCleanupSettings(){
   };
   await fetch(API+'/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
   loadCleanupSettings();
-}
-
-async function toggleModel(id,enabled){
-  const r=await fetch(API+'/api/models/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
-  if(!r.ok){const j=await r.json().catch(()=>({}));showFeatureToast('开启失败',j.error||'操作失败');loadModels();return}
-  loadModels()
 }
 
 // ---- Billing ----
@@ -1409,16 +1025,10 @@ async function refreshVersionInfo(force){
 initUrls();
 loadCleanupSettings();
 refreshVersionInfo(false);
-
-// 定时刷新模型降级状态（仅当模型映射 tab 激活时）
-setInterval(()=>{
-  if(document.getElementById('panel-models').classList.contains('active')){
-    refreshDegradation();
-  }
-},3000);
 </script>
 <script src="/static/js/panels/apikeys.js"></script>
 <script src="/static/js/panels/errors.js"></script>
 <script src="/static/js/panels/providers.js"></script>
+<script src="/static/js/panels/models.js"></script>
 </body>
 </html>
