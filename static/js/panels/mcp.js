@@ -73,7 +73,7 @@ if (window.Vue && window.ElementPlus) {
       "headers": {
         "Authorization": "Bearer &lt;你的项目 API Key&gt;",
         "X-Nacos-Console-Url": "http://your-nacos-host:8848",
-        "X-Nacos-Auth-Url": "http://your-nacos-host:8848/nacos",
+        "X-Nacos-Auth-Url": "http://your-nacos-host:8848",
         "X-Nacos-Username": "nacos",
         "X-Nacos-Password": "你的Nacos密码"
       }
@@ -89,7 +89,7 @@ bearer_token = "&lt;你的项目 API Key&gt;"
 
 [mcp_servers.nacos.http_headers]
 X-Nacos-Console-Url = "http://your-nacos-host:8848"
-X-Nacos-Auth-Url = "http://your-nacos-host:8848/nacos"
+X-Nacos-Auth-Url = "http://your-nacos-host:8848"
 X-Nacos-Username = "nacos"
 X-Nacos-Password = "你的Nacos密码"</pre>
               <span class="form-hint" style="margin-top:6px">Codex CLI 已支持 <code>http_headers</code>（<a href="https://github.com/openai/codex/issues/5180" target="_blank" style="color:var(--primary-h)">#5180</a>，已发布）。<code>bearer_token</code> 是 Codex 的 Authorization Bearer 简写；也可用 <code>bearer_token_env_var = "NACOS_MCP_API_KEY"</code> 从环境变量取。</span>
