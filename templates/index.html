@@ -127,6 +127,13 @@ pre.mcp-code-block{background:var(--card);border:1px solid var(--border);border-
 .mcp-stat{font-size:11px;color:var(--text2);background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:3px 8px;white-space:nowrap}
 .mcp-stat strong{color:var(--text);font-weight:600}
 /* 旧 .mcp-card-toggle 已迁移为 el-button link（mcp.js） */
+/* MCP 面板：标题区固定顶部 + 方块列表/详情区独立滚动（滚动条收在本层，不撑出页面整体） */
+/* 用 flex 链而非固定 calc，由浏览器扣减标题区高度，避免因像素估算不准撑出 body 滚动条 */
+#panel-mcp.panel.active{display:flex;flex-direction:column;height:calc(100vh - 170px)}
+#vue-mcp{flex:1;min-height:0;display:flex;flex-direction:column}
+.mcp-root{display:flex;flex-direction:column;height:100%;min-height:0}
+.mcp-root>.mcp-head{flex-shrink:0}
+.mcp-scroll-wrap{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding-right:8px}
 </style>
 </head>
 <body>

@@ -1,15 +1,17 @@
 // ---- Vue 岛屿：MCP 广场面板（阶段 7）----
 if (window.Vue && window.ElementPlus) {
   const McpTemplate = `
-<div>
-  <!-- 标题区 -->
-  <div style="margin-bottom:18px">
+<div class="mcp-root">
+  <!-- 标题区（固定在顶部，不随列表滚动） -->
+  <div class="mcp-head" style="margin-bottom:18px">
     <h2 style="font-size:18px;font-weight:600">MCP 广场</h2>
     <p style="font-size:13px;color:var(--text2);margin-top:6px;line-height:1.6">所有可用的 MCP 服务。在 AI 客户端（Claude Code / Codex）配置对应端点与 headers 即可调用，点击卡片展开配置详情。</p>
   </div>
 
-  <!-- 卡片网格：新增 MCP 时在 grid 内追加一张 el-card + 对应 detail 块 -->
-  <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px;margin-bottom:8px">
+  <!-- 方块列表 + 详情的滚动容器：滚动条收在本层，不撑出页面整体滚动 -->
+  <div class="mcp-scroll-wrap custom-scroll">
+    <!-- 卡片网格：新增 MCP 时在 grid 内追加一张 el-card + 对应 detail 块 -->
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px;margin-bottom:8px">
     <el-card shadow="hover" :body-style="{padding:'16px',display:'flex',flexDirection:'column',gap:'10px',cursor:'pointer'}" @click="toggle">
       <div style="display:flex;gap:12px;align-items:center">
         <div class="mcp-card-icon">N</div>
@@ -28,7 +30,7 @@ if (window.Vue && window.ElementPlus) {
     </el-card>
   </div>
 
-  <!-- Nacos 配置详情（默认展开） -->
+  <!-- Nacos 配置详情（默认收起，点击卡片展开） -->
   <div v-if="expanded">
     <!-- MCP 客户端配置（headers-only） -->
     <div class="card">
@@ -117,7 +119,7 @@ X-Nacos-Password = "你的Nacos密码"</pre>
         </el-table-column>
       </el-table>
     </div>
-  </div>
+  </div><!-- /.mcp-scroll-wrap -->
 </div>
 `;
 
@@ -126,7 +128,7 @@ X-Nacos-Password = "你的Nacos密码"</pre>
     template: McpTemplate,
     data(){
       return {
-        expanded: true,
+        expanded: false,
         configCollapse: [],
         nacosHeaders: [
           { name:'X-Nacos-Console-Url', desc:'Console API 基址（命名空间 / 配置 CRUD），merged 部署通常<strong>不带</strong> <code>/nacos</code>，如 <code>http://host:8848</code>' },
