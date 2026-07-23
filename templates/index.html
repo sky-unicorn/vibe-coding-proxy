@@ -6,6 +6,12 @@
 <title>Vibe Coding 服务转发</title>
 <link href="/static/lib/jsoneditor/jsoneditor.min.css" rel="stylesheet" type="text/css">
 <link href="/static/lib/jsoneditor/darktheme.css" rel="stylesheet" type="text/css">
+<link href="/static/lib/element-plus/index.css" rel="stylesheet" type="text/css">
+<link href="/static/css/element-plus-dark.css" rel="stylesheet" type="text/css">
+<script src="/static/lib/vue/vue.global.prod.js"></script>
+<script src="/static/lib/element-plus/index.full.min.js"></script>
+<script src="/static/lib/element-plus/zh-cn.min.js"></script>
+<script src="/static/lib/element-plus-icons/index.iife.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{--bg:#0f1117;--card:#1a1d27;--border:#2a2d3a;--text:#e4e4e7;--text2:#9ca3af;--primary:#6366f1;--primary-h:#818cf8;--danger:#ef4444;--success:#22c55e;--warn:#f59e0b}
@@ -373,18 +379,7 @@ pre.mcp-code-block{background:var(--card);border:1px solid var(--border);border-
 
   <!-- API Key 管理 -->
   <div id="panel-apikeys" class="panel">
-    <div class="card">
-      <div class="card-header">
-        <h2>API Key 管理</h2>
-        <button class="btn btn-primary" onclick="openApiKeyModal()">创建 Key</button>
-      </div>
-      <p style="font-size:13px;color:var(--text2);margin-bottom:12px">管理用于访问 Anthropic 和 OpenAI 代理的 API Key。客户端请求时需在请求头中携带此 Key 进行身份验证。</p>
-      <table>
-        <thead><tr><th>名称</th><th>API Key</th><th></th><th>状态</th><th>创建时间</th><th>最后使用</th><th>操作</th></tr></thead>
-        <tbody id="apikeys-tbody"></tbody>
-      </table>
-      <div id="apikeys-empty" class="empty" style="display:none">暂无 API Key，点击上方按钮创建</div>
-    </div>
+    <div id="vue-apikeys"></div>
   </div>
 
   <!-- 计费管理 -->
@@ -666,36 +661,6 @@ X-Nacos-Password = "你的Nacos密码"</pre>
   </div>
 </div>
 
-<!-- API Key Modal -->
-<div class="modal-overlay" id="apikey-modal">
-  <div class="modal" style="width:420px">
-    <h3>创建 API Key</h3>
-    <div class="form-group"><label>Key 名称</label><input id="kf-name" placeholder="如: Claude Code"></div>
-    <div id="apikey-result" style="display:none;margin:12px 0;padding:12px;background:var(--bg);border:1px solid var(--border);border-radius:6px">
-      <div style="font-size:12px;color:var(--warn);margin-bottom:8px">请复制保存此 Key</div>
-      <code id="apikey-created" style="font-size:13px;word-break:break-all;user-select:all;cursor:pointer"></code>
-    </div>
-    <div class="form-actions">
-      <button class="btn" style="background:var(--border);color:var(--text)" onclick="closeApiKeyModal()">关闭</button>
-      <button class="btn btn-primary" id="kf-create-btn" onclick="createApiKey()">创建</button>
-    </div>
-  </div>
-</div>
-
-<!-- API Key 查看 Modal -->
-<div class="modal-overlay" id="apikey-view-modal">
-  <div class="modal" style="width:420px">
-    <h3>查看 API Key</h3>
-    <div style="margin:12px 0;padding:12px;background:var(--bg);border:1px solid var(--border);border-radius:6px">
-      <code id="apikey-view-value" style="font-size:13px;word-break:break-all;user-select:all;cursor:pointer"></code>
-    </div>
-    <div class="form-actions">
-      <button class="btn" style="background:var(--border);color:var(--text)" onclick="closeApiKeyViewModal()">关闭</button>
-      <button class="btn btn-primary" onclick="copyApiKeyView()">复制</button>
-    </div>
-  </div>
-</div>
-
 <!-- 日志详情 Modal -->
 <div class="modal-overlay" id="log-detail-modal">
   <div class="modal" style="width:90vw;max-width:1200px">
@@ -766,7 +731,6 @@ function switchTab(name){
   if(name==='models'){loadDegradationSettings();loadModels();}
   if(name==='errors') loadErrors();
   if(name==='logs'){loadLogProviders();loadLogs();loadCleanupSettings();}
-  if(name==='apikeys') loadApiKeys();
   if(name==='billing') loadBillingOverview();
   if(name==='mcp') updateMcpUrl();
 }
@@ -1444,58 +1408,6 @@ async function toggleModel(id,enabled){
 }
 async function toggleError(id,enabled){await fetch(API+'/api/error-mappings/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});loadErrors()}
 
-// ---- API Keys ----
-async function loadApiKeys(){
-  const r=await(await fetch(API+'/api/keys')).json();
-  const tb=document.getElementById('apikeys-tbody');
-  const empty=document.getElementById('apikeys-empty');
-  if(!r.length){tb.innerHTML='';empty.style.display='';return}
-  empty.style.display='none';
-  tb.innerHTML=r.map(k=>{
-    return `<tr>
-    <td>${esc(k.key_name)}</td>
-    <td><code style="font-size:12px">${esc(k.api_key_prefix)}</code></td>
-    <td style="white-space:nowrap"><button class="btn btn-sm" style="padding:2px 8px;font-size:12px" onclick="viewApiKey(${k.id})">查看</button></td>
-    <td style="white-space:nowrap"><label class="toggle" title="${k.enabled?'点击禁用':'点击启用'}"><input type="checkbox" ${k.enabled?'checked':''} onchange="toggleApiKey(${k.id},this.checked)"><span class="toggle-slider"></span></label> <span class="badge ${k.enabled?'badge-success':'badge-error'}" style="margin-left:4px">${k.enabled?'启用':'禁用'}</span></td>
-    <td style="font-size:12px">${formatTime(k.created_at)}</td>
-    <td style="font-size:12px">${k.last_used_at?formatTime(k.last_used_at):'-'}</td>
-    <td><button class="btn btn-danger btn-sm" onclick="delApiKey(${k.id})">删除</button></td>
-  </tr>`}).join('');
-}
-function openApiKeyModal(){
-  document.getElementById('kf-name').value='';
-  document.getElementById('apikey-result').style.display='none';
-  document.getElementById('kf-create-btn').style.display='';
-  document.getElementById('apikey-modal').classList.add('active');
-}
-function closeApiKeyModal(){
-  document.getElementById('apikey-modal').classList.remove('active');
-}
-async function createApiKey(){
-  const name=document.getElementById('kf-name').value.trim();
-  if(!name){alert('请输入Key名称');return}
-  const r=await(await fetch(API+'/api/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key_name:name})})).json();
-  document.getElementById('apikey-created').textContent=r.api_key;
-  document.getElementById('apikey-result').style.display='';
-  document.getElementById('kf-create-btn').style.display='none';
-  loadApiKeys();
-}
-async function delApiKey(id){if(!confirm('确定删除此 API Key？删除后使用此 Key 的客户端将无法访问代理。'))return;await fetch(API+'/api/keys/'+id,{method:'DELETE'});loadApiKeys();}
-async function toggleApiKey(id,enabled){await fetch(API+'/api/keys/'+id+'/toggle',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});loadApiKeys();}
-async function viewApiKey(id){
-  const r=await(await fetch(API+'/api/keys/'+id)).json();
-  if(r.error){alert('获取 Key 失败');return}
-  document.getElementById('apikey-view-value').textContent=r.api_key;
-  document.getElementById('apikey-view-modal').classList.add('active');
-}
-function closeApiKeyViewModal(){
-  document.getElementById('apikey-view-modal').classList.remove('active');
-}
-function copyApiKeyView(){
-  const v=document.getElementById('apikey-view-value').textContent;
-  navigator.clipboard.writeText(v).then(()=>{alert('已复制到剪贴板')});
-}
-
 // ---- Billing ----
 function billingModeLabel(m){
   return{none:'不限',request_count:'请求次数',token_count:'Token数量',balance:'余额计费'}[m]||'不限';
@@ -1774,5 +1686,6 @@ setInterval(()=>{
   }
 },3000);
 </script>
+<script src="/static/js/panels/apikeys.js"></script>
 </body>
 </html>
