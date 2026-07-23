@@ -514,3 +514,27 @@
 .el-popper::-webkit-scrollbar-thumb:hover,
 .el-select-dropdown::-webkit-scrollbar-thumb:hover,
 .el-cascader__dropdown::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.25); }
+
+/* ---- logs / billing 迁移补充 ---- */
+/* 日志详情 dialog：限制最大高度，body 滚动 */
+.el-dialog { max-width: 1200px; }
+.el-dialog.is-log-detail { max-height: 90vh; display: flex; flex-direction: column; }
+.el-dialog.is-log-detail .el-dialog__body { flex: 1; min-height: 0; overflow-y: auto; }
+
+/* el-pagination 居中（与旧 .pagination 对齐） */
+.el-pagination { justify-content: center; font-size: 13px; }
+
+/* el-drawer body padding 对齐旧 0 24px */
+.el-drawer__body { padding: 0 24px; }
+
+/* 计费表格行：禁用的 provider 置灰 */
+#vue-billing .el-table__row.row-disabled { opacity: 0.6; }
+
+/* el-date-picker 主要单元格色 */
+.el-date-table th { color: var(--text2, #9ca3af); }
+.el-date-table td .cell { color: var(--text, #e4e4e7); }
+.el-date-table td.current:not(.disabled) .cell { background: var(--primary, #6366f1); color: #fff; }
+.el-date-table td.today .cell { color: var(--primary-h, #818cf8); }
+
+/* el-slider 手柄改主色（可选） */
+.el-slider__button { border-color: var(--primary, #6366f1); background: var(--primary, #6366f1); }

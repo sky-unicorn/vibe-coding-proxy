@@ -284,53 +284,7 @@ pre.mcp-code-block{background:var(--card);border:1px solid var(--border);border-
 
   <!-- 日志 -->
   <div id="panel-logs" class="panel">
-    <div class="card">
-      <div class="card-header">
-        <h2>请求日志</h2>
-        <div style="display:flex;gap:8px;align-items:center">
-          <span id="log-stats" style="font-size:12px;color:var(--text2)"></span>
-          <button class="btn btn-primary btn-sm" onclick="loadLogs()">刷新日志</button>
-          <button class="btn btn-danger btn-sm" onclick="clearLogs()">清空日志</button>
-        </div>
-      </div>
-      <div class="filters">
-        <input type="text" id="log-ip-filter" placeholder="按IP筛选" oninput="loadLogs()">
-        <select id="log-provider-filter" onchange="loadLogs()">
-          <option value="">全部提供商</option>
-        </select>
-        <input type="text" id="log-model-filter" placeholder="按模型名过滤" oninput="loadLogs()">
-        <select id="log-status-filter" onchange="loadLogs()">
-          <option value="">全部状态</option>
-          <option value="success">成功</option>
-          <option value="error">失败</option>
-        </select>
-      </div>
-      <table>
-        <thead><tr><th>时间</th><th>调用IP</th><th>提供商</th><th>调用模型</th><th>目标模型</th><th>入/缓/出(token)</th><th>耗时</th><th>原始码</th><th>映射码</th><th>状态</th><th>操作</th></tr></thead>
-        <tbody id="logs-tbody"></tbody>
-      </table>
-      <div id="logs-empty" class="empty" style="display:none">暂无日志</div>
-      <div class="pagination" id="logs-pagination"></div>
-    </div>
-
-    <!-- 自动清理配置 -->
-    <div class="card">
-      <div class="card-header"><h2>自动清理</h2></div>
-      <div style="display:flex;gap:24px;align-items:center;flex-wrap:wrap">
-        <div style="display:flex;align-items:center;gap:8px">
-          <label class="toggle"><input type="checkbox" id="cleanup-enabled" onchange="saveCleanupSettings()"><span class="toggle-slider"></span></label>
-          <span style="font-size:13px">启用自动清理</span>
-        </div>
-        <div style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text2)">
-          保留最近 <input type="number" id="cleanup-days" value="7" min="1" max="365" style="width:60px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px;text-align:center"> 天的日志
-        </div>
-        <div style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text2)">
-          每 <input type="number" id="cleanup-interval" value="1" min="1" max="168" style="width:60px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px;text-align:center"> 小时检查一次
-        </div>
-        <button class="btn btn-primary btn-sm" onclick="saveCleanupSettings()">保存设置</button>
-        <span id="cleanup-info" style="font-size:12px;color:var(--text2)"></span>
-      </div>
-    </div>
+    <div id="vue-logs"></div>
   </div>
 
   <!-- API Key 管理 -->
@@ -340,25 +294,7 @@ pre.mcp-code-block{background:var(--card);border:1px solid var(--border);border-
 
   <!-- 计费管理 -->
   <div id="panel-billing" class="panel">
-    <div class="card">
-      <div class="card-header">
-        <h2>计费概览</h2>
-        <button class="btn btn-primary btn-sm" onclick="loadBillingOverview()">刷新</button>
-      </div>
-      <div class="billing-summary" id="billing-summary"></div>
-      <div class="billing-cards" id="billing-cards"></div>
-      <div id="billing-empty" class="empty" style="display:none">暂无提供商，请先添加提供商</div>
-    </div>
-    <div class="card">
-      <div class="card-header">
-        <h2>提供商计费详情</h2>
-      </div>
-      <table>
-        <thead><tr><th>提供商</th><th>计费模式</th><th>5小时</th><th>一周</th><th>一月</th><th>余额</th><th>到期时间</th><th>状态</th><th>操作</th></tr></thead>
-        <tbody id="billing-tbody"></tbody>
-      </table>
-      <div id="billing-table-empty" class="empty" style="display:none">暂无计费数据</div>
-    </div>
+    <div id="vue-billing"></div>
   </div>
 
   <!-- MCP / Nacos -->
@@ -482,66 +418,11 @@ X-Nacos-Password = "你的Nacos密码"</pre>
   </div>
 </div>
 
-<!-- 日志详情 Modal -->
-<div class="modal-overlay" id="log-detail-modal">
-  <div class="modal" style="width:90vw;max-width:1200px">
-    <h3>请求详情</h3>
-    <div class="modal-body" id="log-detail-content"></div>
-    <div class="form-actions"><button class="btn btn-primary" onclick="closeLogDetail()">关闭</button></div>
-  </div>
-</div>
-
-<!-- 计费设置 Drawer -->
-<div class="billing-drawer-overlay" id="billing-drawer-overlay" onclick="closeBillingPanel()">
-  <div class="billing-drawer" onclick="event.stopPropagation()">
-    <div class="billing-drawer-header">
-      <h3 id="billing-panel-title">计费设置</h3>
-      <button class="btn btn-sm" style="background:var(--border);color:var(--text)" onclick="closeBillingPanel()">✕</button>
-    </div>
-    <div class="billing-drawer-body">
-      <input type="hidden" id="bp-provider-id">
-      <div class="form-group"><label>计费模式</label>
-        <select id="bp-billing-mode" onchange="toggleBillingFieldsBp()">
-          <option value="none">不限（无限制）</option>
-          <option value="request_count">请求次数限制</option>
-          <option value="token_count">Token数量限制</option>
-          <option value="balance">余额计费</option>
-        </select>
-      </div>
-      <div id="bp-limits-fields" style="display:none">
-        <div class="form-group"><label>5小时限制 <span style="color:var(--text2);font-size:11px">（留空=不限）</span></label><input id="bp-limit-5h" type="number" min="0" placeholder="不限"></div>
-        <div class="form-group"><label>一周限制 <span style="color:var(--text2);font-size:11px">（留空=不限）</span></label><input id="bp-limit-week" type="number" min="0" placeholder="不限"></div>
-        <div class="form-group"><label>一月限制 <span style="color:var(--text2);font-size:11px">（留空=不限）</span></label><input id="bp-limit-month" type="number" min="0" placeholder="不限"></div>
-      </div>
-      <div id="bp-balance-fields" style="display:none">
-        <div class="form-group"><label>余额</label><input id="bp-balance" type="number" min="0" step="0.01" placeholder="0.00"></div>
-        <div class="price-row">
-          <div class="form-group"><label>输入价格（/百万Token）</label><input id="bp-input-price" type="number" min="0" step="0.01" placeholder="0.00"></div>
-          <div class="form-group"><label>输出价格（/百万Token）</label><input id="bp-output-price" type="number" min="0" step="0.01" placeholder="0.00"></div>
-        </div>
-        <div class="form-group"><label>缓存命中价格（/百万Token） <span style="color:var(--text2);font-size:11px">（留空=输入价格的10%）</span></label><input id="bp-cache-read-price" type="number" min="0" step="0.01" placeholder="自动"></div>
-      </div>
-      <div id="bp-common-billing-fields" style="display:none">
-        <div class="form-group"><label>到期时间 <span style="color:var(--text2);font-size:11px">（留空=无期限）</span></label><input id="bp-expiration" type="date"></div>
-        <div class="form-group"><label>警告阈值: <span id="bp-threshold-val">80</span>%</label><input id="bp-threshold" type="range" min="50" max="100" value="80" oninput="document.getElementById('bp-threshold-val').textContent=this.value"></div>
-      </div>
-      <div id="bp-billing-id" style="display:none"></div>
-    </div>
-    <div class="billing-drawer-footer">
-      <button class="btn" style="background:var(--border);color:var(--text)" onclick="closeBillingPanel()">取消</button>
-      <button class="btn btn-primary" onclick="saveBillingPanel()">保存计费</button>
-    </div>
-  </div>
-</div>
+<!-- 日志详情 / 计费设置 已迁移为 Vue 岛屿内的 el-dialog / el-drawer（static/js/panels/logs.js、billing.js） -->
 
 <script src="/static/lib/jsoneditor/jsoneditor.js"></script>
 <script>
 const API='';
-let logPage=1;
-const _dataStore={providers:{},models:{},errors:{},logs:{}};
-let _dataIdx={providers:0,models:0,errors:0,logs:0};
-let _jsonEditors=[];
-function _store(type,obj){const i=++_dataIdx[type];_dataStore[type][i]=obj;return i;}
 
 function switchTab(name){
   document.querySelectorAll('.tab').forEach((t,i)=>{t.classList.toggle('active',['providers','models','errors','logs','apikeys','billing','mcp'][i]===name)});
@@ -550,8 +431,8 @@ function switchTab(name){
   if(location.hash!=='#'+name) history.replaceState(null,'','#'+name);
   if(name==='providers') window.__reloadProviders?.();
   if(name==='models'){window.__reloadModels?.();}
-  if(name==='logs'){loadLogProviders();loadLogs();loadCleanupSettings();}
-  if(name==='billing') loadBillingOverview();
+  if(name==='logs') window.__reloadLogs?.();
+  if(name==='billing') window.__reloadBilling?.();
   if(name==='mcp') updateMcpUrl();
 }
 window.addEventListener('DOMContentLoaded',()=>{
@@ -589,354 +470,13 @@ function closeFeatureToast(){
   setTimeout(()=>{const t=document.getElementById('feature-toast');if(t)t.remove();},200);
 }
 
-// ---- Logs ----
-async function loadLogProviders(){
-  try{
-    const r=await(await fetch(API+'/api/logs/providers')).json();
-    const sel=document.getElementById('log-provider-filter');
-    const current=sel.value;
-    sel.innerHTML='<option value="">全部提供商</option>'+r.map(p=>`<option value="${esc(p)}">${esc(p)}</option>`).join('');
-    sel.value=current;
-  }catch(e){}
-}
-async function loadLogs(p){
-  if(p) logPage=p;
-  const ip=document.getElementById('log-ip-filter').value;
-  const provider=document.getElementById('log-provider-filter').value;
-  const model=document.getElementById('log-model-filter').value;
-  const status=document.getElementById('log-status-filter').value;
-  const params=new URLSearchParams({page:logPage,per_page:30});
-  if(ip) params.set('ip',ip);
-  if(provider) params.set('provider',provider);
-  if(model) params.set('model',model);
-  if(status) params.set('status',status);
-  const r=await(await fetch(API+'/api/logs?'+params)).json();
-  const tb=document.getElementById('logs-tbody');
-  const empty=document.getElementById('logs-empty');
-  if(!r.logs.length){tb.innerHTML='';empty.style.display='';document.getElementById('log-stats').textContent=`共 ${r.total} 条日志`;return}
-  empty.style.display='none';
-  tb.innerHTML=r.logs.map(l=>{
-    const origCode=l.original_status_code||0;
-    const mappedCode=l.mapped_status_code||0;
-    const codeChanged=origCode&&mappedCode&&origCode!==mappedCode;
-    return `<tr>
-    <td style="white-space:nowrap">${formatTime(l.request_time)}</td>
-    <td style="font-size:12px;font-family:monospace">${esc(l.client_ip||'-')}</td>
-    <td>${esc(l.provider)}</td>
-    <td><code style="font-size:12px">${esc(l.source_model||l.model)}</code></td>
-    <td><code style="font-size:12px">${esc(l.model)}</code></td>
-    <td style="font-family:monospace;font-size:12px;white-space:nowrap">${l.input_tokens||0}<span style="color:var(--text2)">/</span>${l.cache_read_input_tokens||0}<span style="color:var(--text2)">/</span>${l.output_tokens||0}</td>
-    <td>${(l.duration_ms/1000).toFixed(2)}s</td>
-    <td>${origCode?`<span class="badge ${origCode>=400?'badge-error':'badge-success'}">${origCode}</span>`:'-'}</td>
-    <td>${mappedCode&&codeChanged?`<span class="badge badge-warn">${mappedCode}</span>`:origCode?`<span class="badge ${origCode>=400?'badge-error':'badge-success'}">${mappedCode||origCode}</span>`:'-'}</td>
-    <td>${l.status==='success'?'<span class="badge badge-success">成功</span>':'<span class="badge badge-error">失败</span>'}</td>
-    <td><button class="btn btn-sm" style="background:var(--border);color:var(--text)" onclick="showLogDetail(_dataStore.logs[${_store('logs',l)}])">详情</button></td>
-  </tr>`}).join('');
-  const pages=Math.ceil(r.total/r.per_page);
-  document.getElementById('logs-pagination').innerHTML=`
-    <button ${logPage<=1?'disabled':''} onclick="loadLogs(${logPage-1})">上一页</button>
-    <span>${logPage} / ${pages||1} 页 (共 ${r.total} 条)</span>
-    <button ${logPage>=pages?'disabled':''} onclick="loadLogs(${logPage+1})">下一页</button>`;
-  document.getElementById('log-stats').textContent=`共 ${r.total} 条日志`;
-}
-function parseSSE(str){
-  // 检测是否为 SSE 格式（包含 event: 或 data: 行）
-  if(!/^(event:|data:)\s/m.test(str)) return null;
-  const events=[];
-  let cur={};
-  for(const line of str.split('\n')){
-    const t=line.trim();
-    if(!t){if(cur.event||cur.data){events.push(cur);cur={}}continue}
-    if(t.startsWith('event:'))cur.event=t.slice(6).trim();
-    else if(t.startsWith('data:')){
-      const raw=t.slice(5).trim();
-      cur.data_raw=(cur.data_raw||'')+(cur.data_raw?'':'')+raw;
-      if(raw==='[DONE]'){cur.data='[DONE]'}
-      else{try{cur.data=JSON.parse(raw)}catch{cur.data=raw}}
-    }
-  }
-  if(cur.event||cur.data)events.push(cur);
-  // 合并为可读结构
-  const result={};
-  const message_start=[];const content_deltas=[];const message_deltas=[];
-  let usage=null;let message=null;
-  for(const e of events){
-    if(e.event==='message_start'&&e.data&&typeof e.data==='object'){
-      message_start.push(e.data);
-      if(e.data.message)message=e.data.message;
-    }else if(e.event==='content_block_start'&&e.data){
-      // skip
-    }else if(e.event==='content_block_delta'&&e.data&&typeof e.data==='object'){
-      content_deltas.push(e.data);
-    }else if(e.event==='content_block_stop'&&e.data){
-      // skip
-    }else if(e.event==='message_delta'&&e.data&&typeof e.data==='object'){
-      message_deltas.push(e.data);
-      if(e.data.usage)usage=e.data.usage;
-    }else if(e.event==='message_stop'&&e.data){
-      // skip
-    }else if(e.event==='ping'){
-      // skip
-    }else{
-      if(!result._other)result._other=[];
-      result._other.push(e);
-    }
-  }
-  // 构建合并后的响应
-  if(message){
-    // 重建完整 message：合并 content
-    const merged=JSON.parse(JSON.stringify(message));
-    if(content_deltas.length>0&&merged.content){
-      for(const delta of content_deltas){
-        const idx=delta.index||0;
-        const d=delta.delta;
-        if(d&&merged.content[idx]){
-          if(d.type==='text_delta'&&d.text)merged.content[idx].text=(merged.content[idx].text||'')+d.text;
-          else if(d.type==='input_json_delta'&&d.partial_json)merged.content[idx].partial_json=(merged.content[idx].partial_json||'')+d.partial_json;
-          else Object.assign(merged.content[idx],d);
-        }
-      }
-    }
-    result.message=merged;
-  }
-  if(usage)result.usage=usage;
-  if(message_deltas.length>0)result.message_delta=message_deltas;
-  if(message_start.length>0)result.message_start=message_start;
-  // 如果只有 content_deltas 没有完整 message，展示合并的 delta 列表
-  if(!message&&content_deltas.length>0){
-    const texts=[];
-    for(const d of content_deltas){
-      if(d.delta&&d.delta.text)texts.push(d.delta.text);
-    }
-    result.merged_text=texts.join('');
-    result.content_deltas=content_deltas;
-  }
-  return Object.keys(result).length>0?result:null;
-}
-function renderJson(str){
-  // 先尝试直接解析 JSON
-  try{JSON.parse(str);const id='je'+Math.random().toString(36).slice(2,8);setTimeout(()=>{const wrap=document.getElementById(id);if(!wrap)return;try{const ed=new JSONEditor(wrap,{mode:'code',mainMenuBar:false,navigationBar:false,statusBar:false},JSON.parse(str));_jsonEditors.push(ed);setTimeout(()=>{if(ed.aceEditor)ed.aceEditor.resize()},100)}catch(e){wrap.innerHTML='<div class="log-detail custom-scroll">'+esc(str)+'</div>'}},0);return '<div class="json-editor-wrap" id="'+id+'"></div>'}catch(e){}
-  // 非 JSON，尝试解析 SSE 流式响应
-  const sseParsed=parseSSE(str);
-  if(sseParsed){
-    const id='je'+Math.random().toString(36).slice(2,8);
-    setTimeout(()=>{
-      const wrap=document.getElementById(id);
-      if(!wrap)return;
-      try{
-        const ed=new JSONEditor(wrap,{mode:'code',mainMenuBar:false,navigationBar:false,statusBar:false},sseParsed);
-        _jsonEditors.push(ed);
-        setTimeout(()=>{if(ed.aceEditor)ed.aceEditor.resize()},100);
-      }catch(ex){wrap.innerHTML='<div class="log-detail custom-scroll">'+esc(str)+'</div>'}
-    },0);
-    return '<div class="json-editor-wrap" id="'+id+'"></div><div style="font-size:11px;color:var(--text2);margin-top:4px">SSE 流式响应已解析为 JSON</div>';
-  }
-  return '<div class="log-detail custom-scroll">'+esc(str)+'</div>';
-}
-function showLogDetail(l){
-  let html='';
-  const origCode=l.original_status_code||0;
-  const mappedCode=l.mapped_status_code||0;
-  if(origCode&&mappedCode&&origCode!==mappedCode){
-    html+=`<div style="margin-bottom:12px;padding:8px 12px;background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.3);border-radius:6px;font-size:13px"><strong style="color:var(--warn)">错误码映射:</strong> ${origCode} &rarr; ${mappedCode}（Claude Code 收到 ${mappedCode}，日志记录原始 ${origCode}）</div>`;
-  }
-  if(l.error_msg) html+=`<div style="margin-bottom:12px"><strong style="color:var(--danger)">错误:</strong> ${esc(l.error_msg)}</div>`;
-  const hasReq=!!l.request_body,hasResp=!!l.response_body;
-  if(hasReq&&hasResp){
-    html+=`<div class="detail-columns">`;
-    html+=`<div class="detail-col"><strong>请求体:</strong>${renderJson(l.request_body)}</div>`;
-    html+=`<div class="detail-col"><strong>响应体:</strong>${renderJson(l.response_body)}</div>`;
-    html+=`</div>`;
-  }else{
-    if(hasReq) html+=`<div style="margin-bottom:8px"><strong>请求体:</strong>${renderJson(l.request_body)}</div>`;
-    if(hasResp) html+=`<div><strong>响应体:</strong>${renderJson(l.response_body)}</div>`;
-  }
-  _jsonEditors.forEach(ed=>{try{ed.destroy()}catch(e){}});
-  _jsonEditors=[];
-  document.getElementById('log-detail-content').innerHTML=html;
-  document.getElementById('log-detail-modal').classList.add('active');
-}
-function closeLogDetail(){
-  _jsonEditors.forEach(ed=>{try{ed.destroy()}catch(e){}});
-  _jsonEditors=[];
-  document.getElementById('log-detail-modal').classList.remove('active');
-}
-async function clearLogs(){if(!confirm('确定清空所有日志？'))return;await fetch(API+'/api/logs',{method:'DELETE'});loadLogs();}
-
-// ---- Cleanup Settings ----
-async function loadCleanupSettings(){
-  const [settings,stats]=await Promise.all([fetch(API+'/api/settings').then(r=>r.json()),fetch(API+'/api/logs/stats').then(r=>r.json())]);
-  document.getElementById('cleanup-enabled').checked=settings.auto_cleanup_enabled==='1';
-  document.getElementById('cleanup-days').value=settings.cleanup_retention_days||'7';
-  document.getElementById('cleanup-interval').value=settings.cleanup_interval_hours||'1';
-  let info='';
-  if(settings.last_cleanup_time) info+=`上次清理: ${settings.last_cleanup_time}`;
-  if(stats.total>0) info+=` | 共 ${stats.total} 条日志`;
-  document.getElementById('cleanup-info').textContent=info;
-  document.getElementById('log-stats').textContent=`共 ${stats.total} 条日志`;
-}
-async function saveCleanupSettings(){
-  const data={
-    auto_cleanup_enabled:document.getElementById('cleanup-enabled').checked?'1':'0',
-    cleanup_retention_days:document.getElementById('cleanup-days').value,
-    cleanup_interval_hours:document.getElementById('cleanup-interval').value,
-  };
-  await fetch(API+'/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
-  loadCleanupSettings();
-}
+// ---- Logs / Cleanup 已迁移为 Vue 岛屿 static/js/panels/logs.js ----
 
 // ---- Billing ----
 function billingModeLabel(m){
   return{none:'不限',request_count:'请求次数',token_count:'Token数量',balance:'余额计费'}[m]||'不限';
 }
-function toggleBillingFieldsBp(){
-  const mode=document.getElementById('bp-billing-mode').value;
-  document.getElementById('bp-limits-fields').style.display=(mode==='request_count'||mode==='token_count')?'block':'none';
-  document.getElementById('bp-balance-fields').style.display=mode==='balance'?'block':'none';
-  document.getElementById('bp-common-billing-fields').style.display=mode!=='none'?'block':'none';
-}
-function closeBillingPanel(){document.getElementById('billing-drawer-overlay').classList.remove('active')}
-async function saveBillingPanel(){
-  const pid=document.getElementById('bp-provider-id').value;
-  const mode=document.getElementById('bp-billing-mode').value;
-  const hasBilling=document.getElementById('bp-billing-id').textContent==='exists';
-  if(mode==='none'){
-    if(hasBilling) await fetch(API+'/api/providers/'+pid+'/billing',{method:'DELETE'});
-  }else{
-    const bData={billing_mode:mode,warning_threshold:parseInt(document.getElementById('bp-threshold').value)/100};
-    if(mode==='request_count'||mode==='token_count'){
-      bData.limit_5h=parseInt(document.getElementById('bp-limit-5h').value)||null;
-      bData.limit_week=parseInt(document.getElementById('bp-limit-week').value)||null;
-      bData.limit_month=parseInt(document.getElementById('bp-limit-month').value)||null;
-    }
-    if(mode==='balance'){
-      bData.balance=parseFloat(document.getElementById('bp-balance').value)||0;
-      bData.input_price_per_million=parseFloat(document.getElementById('bp-input-price').value)||0;
-      bData.output_price_per_million=parseFloat(document.getElementById('bp-output-price').value)||0;
-      const crpRaw=document.getElementById('bp-cache-read-price').value;
-      if(crpRaw!==''){bData.cache_read_price_per_million=parseFloat(crpRaw)||0;}
-    }
-    const expVal=document.getElementById('bp-expiration').value;
-    bData.expiration_date=expVal||null;
-    const method=hasBilling?'PUT':'POST';
-    await fetch(API+'/api/providers/'+pid+'/billing',{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(bData)});
-  }
-  closeBillingPanel();window.__reloadProviders?.();
-}
-function billingBarColor(pct){
-  if(pct>=95)return 'full';if(pct>=80)return 'danger';if(pct>=60)return 'warn';return 'ok';
-}
-function renderBillingBar(used,limit,label){
-  if(!limit||limit<=0)return `<span style="color:var(--text2);font-size:12px">-</span>`;
-  const pct=Math.min(100,Math.round(used/limit*100));
-  const cls=billingBarColor(pct);
-  return `<div style="display:flex;align-items:center;gap:6px;min-width:140px"><div style="flex:1;height:6px;background:var(--border);border-radius:3px;overflow:hidden;min-width:40px"><div class="bar-fill ${cls}" style="width:${pct}%"></div></div><span style="font-size:11px;color:var(--text2);white-space:nowrap">${formatTokens(used)}/${formatTokens(limit)} (${pct}%)</span></div>`;
-}
-function getUsageByWindow(usages,windowType){
-  for(const u of usages){if(u.window_type===windowType)return u;}
-  return null;
-}
-async function loadBillingOverview(){
-  const data=await(await fetch(API+'/api/providers/billing/overview')).json();
-  const tbody=document.getElementById('billing-tbody');
-  const empty=document.getElementById('billing-empty');
-  const tableEmpty=document.getElementById('billing-table-empty');
-  const cardsDiv=document.getElementById('billing-cards');
-  const summaryDiv=document.getElementById('billing-summary');
-  if(!data.length){tbody.innerHTML='';cardsDiv.innerHTML='';summaryDiv.innerHTML='';empty.style.display='';tableEmpty.style.display='';return;}
-  empty.style.display='none';tableEmpty.style.display='none';
-  // Summary stats
-  const total=data.length;
-  const withBilling=data.filter(d=>d.has_billing).length;
-  const nearLimit=data.filter(d=>d.near_limit).length;
-  const blocked=data.filter(d=>!d.allowed).length;
-  summaryDiv.innerHTML=`
-    <div class="billing-stat"><div class="val">${total}</div><div class="lbl">提供商总数</div></div>
-    <div class="billing-stat"><div class="val" style="color:var(--primary)">${withBilling}</div><div class="lbl">已配置计费</div></div>
-    <div class="billing-stat"><div class="val" style="color:var(--warn)">${nearLimit}</div><div class="lbl">接近限额</div></div>
-    <div class="billing-stat"><div class="val" style="color:var(--danger)">${blocked}</div><div class="lbl">已超限</div></div>`;
-  // Cards
-  cardsDiv.innerHTML=data.map(d=>{
-    const c=d.billing_config;
-    const mode=c?c.billing_mode:'none';
-    let usageHtml='';
-    if(c&&(mode==='request_count'||mode==='token_count')){
-      ['5h','week','month'].forEach(w=>{
-        const u=getUsageByWindow(d.usage,w);
-        const limit=c['limit_'+w];
-        if(!limit||limit<=0)return;
-        const used=mode==='request_count'?(u?u.request_count:0):(u?(u.input_tokens+u.output_tokens):0);
-        const pct=Math.min(100,Math.round(used/limit*100));
-        usageHtml+=`<div class="usage-row"><span class="usage-label">${w==='5h'?'5小时':w==='week'?'一周':'一月'}</span><div class="usage-bar"><div class="usage-bar-fill bar-fill ${billingBarColor(pct)}" style="width:${pct}%"></div></div><span class="usage-val">${mode==='request_count'?used+'次':formatTokens(used)} / ${mode==='request_count'?limit+'次':formatTokens(limit)}</span></div>`;
-      });
-    }
-    if(c&&mode==='balance'){
-      const bal=c.balance||0;
-      usageHtml+=`<div class="usage-row"><span class="usage-label">余额</span><div class="usage-bar"><div class="usage-bar-fill bar-fill ${bal<=0?'full':'ok'}" style="width:${bal>0?100:0}%"></div></div><span class="usage-val">¥${bal.toFixed(2)}</span></div>`;
-    }
-    const statusBadge=d.has_billing?(d.allowed?(d.near_limit?'<span class="badge badge-warn">接近限额</span>':'<span class="badge badge-success">正常</span>'):'<span class="badge badge-error">已超限</span>'):'<span class="badge badge-success">不限</span>';
-    return `<div class="usage-card"><div class="usage-card-header"><h4>${esc(d.provider_name)}</h4><span class="badge badge-billing-${mode}">${billingModeLabel(mode)}</span></div>${usageHtml||'<div style="font-size:12px;color:var(--text2)">暂无使用数据</div>'}<div style="margin-top:8px;font-size:12px">${statusBadge}${c&&c.expiration_date?'<span style="margin-left:8px;color:var(--text2)">到期: '+c.expiration_date+'</span>':''}</div></div>`;
-  }).join('');
-  // Table
-  tbody.innerHTML=data.map(d=>{
-    const c=d.billing_config;
-    const mode=c?c.billing_mode:'none';
-    const usages5h=getUsageByWindow(d.usage,'5h');
-    const usagesWeek=getUsageByWindow(d.usage,'week');
-    const usagesMonth=getUsageByWindow(d.usage,'month');
-    const cell=(usage,limit,wMode)=>{
-      if(!limit||limit<=0)return '<span style="color:var(--text2)">-</span>';
-      const used=wMode==='request_count'?(usage?usage.request_count:0):(usage?(usage.input_tokens+usage.output_tokens):0);
-      return renderBillingBar(used,limit);
-    };
-    let row5h='-',rowWeek='-',rowMonth='-',rowBalance='-';
-    if(c&&(mode==='request_count'||mode==='token_count')){
-      row5h=cell(usages5h,c.limit_5h,mode);
-      rowWeek=cell(usagesWeek,c.limit_week,mode);
-      rowMonth=cell(usagesMonth,c.limit_month,mode);
-    }
-    if(c&&mode==='balance'){
-      rowBalance=`<span style="font-family:monospace;font-size:13px">¥${(c.balance||0).toFixed(2)}</span>`;
-    }
-    const expCell=c&&c.expiration_date?(new Date(c.expiration_date)<new Date()?`<span class="badge badge-error">已过期</span>`:`<span style="font-size:12px">${c.expiration_date}</span>`):'<span style="color:var(--text2)">-</span>';
-    const statusBadge=d.enabled?'<span class="badge badge-success">启用</span>':'<span class="badge badge-error">禁用</span>';
-    return `<tr style="${!d.enabled?'opacity:.6':''}">
-      <td>${esc(d.provider_name)}</td>
-      <td><span class="badge badge-billing-${mode}">${billingModeLabel(mode)}</span></td>
-      <td>${row5h}</td>
-      <td>${rowWeek}</td>
-      <td>${rowMonth}</td>
-      <td>${rowBalance}</td>
-      <td>${expCell}</td>
-      <td>${statusBadge}</td>
-      <td><button class="btn btn-sm" style="background:var(--border);color:var(--text)" onclick="editProviderBilling(${d.provider_id})">计费设置</button></td>
-    </tr>`;
-  }).join('');
-}
-async function editProviderBilling(pid){
-  const [providers,billing]=await Promise.all([fetch(API+'/api/providers').then(r=>r.json()),fetch(API+'/api/providers/billing/overview').then(r=>r.json()).catch(()=>[])]);
-  const billingMap={};
-  (billing||[]).forEach(b=>{if(b.has_billing) billingMap[b.provider_id]=b.billing_config;});
-  const p=providers.find(x=>x.id===pid);
-  if(!p)return;
-  const b=billingMap[p.id]||null;
-  document.getElementById('bp-provider-id').value=p.id;
-  document.getElementById('billing-panel-title').textContent=esc(p.name)+' - 计费设置';
-  document.getElementById('bp-billing-mode').value=b?b.billing_mode:'none';
-  document.getElementById('bp-limit-5h').value=b&&b.limit_5h?b.limit_5h:'';
-  document.getElementById('bp-limit-week').value=b&&b.limit_week?b.limit_week:'';
-  document.getElementById('bp-limit-month').value=b&&b.limit_month?b.limit_month:'';
-  document.getElementById('bp-balance').value=b?b.balance:'';
-  document.getElementById('bp-input-price').value=b?b.input_price_per_million:'';
-  document.getElementById('bp-output-price').value=b?b.output_price_per_million:'';
-  document.getElementById('bp-cache-read-price').value=b&&b.cache_read_price_per_million?b.cache_read_price_per_million:'';
-  document.getElementById('bp-expiration').value=b&&b.expiration_date?b.expiration_date:'';
-  document.getElementById('bp-threshold').value=b?Math.round(b.warning_threshold*100):80;
-  document.getElementById('bp-threshold-val').textContent=b?Math.round(b.warning_threshold*100):80;
-  document.getElementById('bp-billing-id').textContent=b?'exists':'';
-  toggleBillingFieldsBp();
-  document.getElementById('billing-drawer-overlay').classList.add('active');
-}
+
 
 // ---- MCP 广场 ----
 function toggleMcpDetail(name){
@@ -1023,12 +563,13 @@ async function refreshVersionInfo(force){
 
 // Init
 initUrls();
-loadCleanupSettings();
 refreshVersionInfo(false);
 </script>
 <script src="/static/js/panels/apikeys.js"></script>
 <script src="/static/js/panels/errors.js"></script>
 <script src="/static/js/panels/providers.js"></script>
 <script src="/static/js/panels/models.js"></script>
+<script src="/static/js/panels/billing.js"></script>
+<script src="/static/js/panels/logs.js"></script>
 </body>
 </html>
