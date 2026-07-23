@@ -95,30 +95,30 @@ if (window.Vue && window.ElementPlus) {
 
   <!-- 日志详情弹窗 -->
   <el-dialog v-model="detailVisible" title="请求详情" width="90vw" :close-on-click-modal="false" class="is-log-detail" @close="onDetailClose">
-    <div style="max-width:1200px;margin:0 auto">
+    <div class="log-detail-inner">
       <!-- 错误码映射提示 -->
       <div v-if="detailRow && detailRow.original_status_code && detailRow.mapped_status_code && detailRow.original_status_code!==detailRow.mapped_status_code"
-           style="margin-bottom:12px;padding:8px 12px;background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.3);border-radius:6px;font-size:13px">
-        <strong style="color:var(--warn)">错误码映射:</strong> [[ detailRow.original_status_code ]] &rarr; [[ detailRow.mapped_status_code ]]（Claude Code 收到 [[ detailRow.mapped_status_code ]]，日志记录原始 [[ detailRow.original_status_code ]]）
+           class="log-detail-hint log-detail-hint--warn">
+        <strong>错误码映射:</strong> [[ detailRow.original_status_code ]] &rarr; [[ detailRow.mapped_status_code ]]（Claude Code 收到 [[ detailRow.mapped_status_code ]]，日志记录原始 [[ detailRow.original_status_code ]]）
       </div>
-      <div v-if="detailRow && detailRow.error_msg" style="margin-bottom:12px">
-        <strong style="color:var(--danger)">错误:</strong> [[ esc(detailRow.error_msg) ]]
+      <div v-if="detailRow && detailRow.error_msg" class="log-detail-hint log-detail-hint--error">
+        <strong>错误:</strong> [[ esc(detailRow.error_msg) ]]
       </div>
 
-      <!-- 双列布局 -->
+      <!-- 请求/响应体：左右并排对比 -->
       <div v-if="detailRow && (detailRow.request_body || detailRow.response_body)" class="detail-columns">
         <div class="detail-col">
-          <strong>请求体:</strong>
+          <div class="detail-col-label">请求体</div>
           <div v-if="detailRow.request_body" :id="reqEditorId" class="json-editor-wrap"></div>
           <pre v-else class="log-detail custom-scroll">（空）</pre>
         </div>
         <div class="detail-col">
-          <strong>响应体:</strong>
+          <div class="detail-col-label">响应体</div>
           <div v-if="detailRow.response_body" :id="respEditorId" class="json-editor-wrap"></div>
           <pre v-else class="log-detail custom-scroll">（空）</pre>
         </div>
       </div>
-      <div v-else-if="detailRow" style="color:var(--text2);text-align:center;padding:20px">无请求/响应体</div>
+      <div v-else-if="detailRow" class="log-detail-empty">无请求/响应体</div>
     </div>
     <template #footer>
       <el-button @click="detailVisible=false">关闭</el-button>
@@ -313,10 +313,16 @@ if (window.Vue && window.ElementPlus) {
         for(const line of str.split('\n')){
           const t = line.trim();
           if(!t){ if(cur.event||cur.data){ events.push(cur); cur={}; } continue; }
-          if(t.startsWith('event:')) cur.event = t.slice(6).trim();
+          if(t.startsWith('event:')){
+            // 遇到新 event 行时，先 push 上一个 event 块
+            // 后端存 SSE 时可能去掉空行分隔符，不能仅依赖空行来分隔
+            if(cur.event || cur.data){ events.push(cur); cur = {}; }
+            cur.event = t.slice(6).trim();
+          }
           else if(t.startsWith('data:')){
             const raw = t.slice(5).trim();
-            cur.data_raw = (cur.data_raw || '') + raw;
+            // data_raw 记录原始 data 行
+            cur.data_raw = (cur.data_raw || '') + (cur.data_raw ? '' : '') + raw;
             if(raw==='[DONE]'){ cur.data='[DONE]'; }
             else{ try{ cur.data=JSON.parse(raw); }catch{ cur.data=raw; } }
           }
@@ -325,14 +331,15 @@ if (window.Vue && window.ElementPlus) {
 
         // 合并为可读结构
         const result = {};
-        const message_start = []; const content_deltas = []; const message_deltas = [];
+        const message_start = []; const content_blocks = []; const content_deltas = []; const message_deltas = [];
         let usage = null; let message = null;
         for(const e of events){
           if(e.event==='message_start' && e.data && typeof e.data==='object'){
             message_start.push(e.data);
             if(e.data.message) message = e.data.message;
-          } else if(e.event==='content_block_start' && e.data){
-            // skip
+          } else if(e.event==='content_block_start' && e.data && typeof e.data==='object'){
+            // 记录 content block 元信息（index/type/name/id），后续用它预占 message.content[idx]
+            content_blocks.push(e.data);
           } else if(e.event==='content_block_delta' && e.data && typeof e.data==='object'){
             content_deltas.push(e.data);
           } else if(e.event==='content_block_stop' && e.data){
@@ -352,15 +359,34 @@ if (window.Vue && window.ElementPlus) {
         // 构建合并后的响应
         if(message){
           const merged = JSON.parse(JSON.stringify(message));
-          if(content_deltas.length>0 && merged.content){
+          // 用 content_blocks 预填充 message.content 占位（保留 type/name/id 等元信息）
+          for(const blk of content_blocks){
+            const idx = blk.index != null ? blk.index : 0;
+            while(merged.content.length <= idx) merged.content.push(null);
+            if(blk.content_block){
+              merged.content[idx] = JSON.parse(JSON.stringify(blk.content_block));
+              // input_json_delta 累积前先把 input 置空字符串
+              if(merged.content[idx].type === 'tool_use') merged.content[idx].input = '';
+            }
+          }
+          if(content_deltas.length > 0){
             for(const delta of content_deltas){
               const idx = delta.index||0;
               const d = delta.delta;
-              if(d && merged.content[idx]){
+              if(!merged.content[idx]) merged.content[idx] = { type: 'text' };
+              if(d){
                 if(d.type==='text_delta' && d.text) merged.content[idx].text = (merged.content[idx].text||'') + d.text;
-                else if(d.type==='input_json_delta' && d.partial_json) merged.content[idx].partial_json = (merged.content[idx].partial_json||'') + d.partial_json;
+                else if(d.type==='input_json_delta' && d.partial_json){
+                  merged.content[idx].input = (merged.content[idx].input||'') + d.partial_json;
+                }
                 else Object.assign(merged.content[idx], d);
               }
+            }
+          }
+          // tool_use 的 input 拼完后尝试 JSON.parse 回对象
+          for(const c of merged.content){
+            if(c && c.type==='tool_use' && typeof c.input==='string' && c.input){
+              try{ c.input = JSON.parse(c.input); }catch{ /* 保留为字符串 */ }
             }
           }
           result.message = merged;
