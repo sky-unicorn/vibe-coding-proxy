@@ -278,11 +278,16 @@ if (window.Vue && window.ElementPlus) {
         window.editProviderBilling?.(id);
       },
       showEnabledToast(enabled){
-        if(typeof window.showFeatureToast==='function'){
-          window.showFeatureToast(enabled?'已启用提供商':'已停用提供商', enabled
+        ElementPlus.ElNotification({
+          title: enabled?'已启用提供商':'已停用提供商',
+          message: enabled
             ? '该提供商下所有映射模型已同步置为<strong>启用</strong>。'
-            : '该提供商下所有映射模型已同步置为<strong>停用</strong>。');
-        }
+            : '该提供商下所有映射模型已同步置为<strong>停用</strong>。',
+          dangerouslyUseHTMLString: true,
+          type: 'success',
+          duration: 2000,
+          position: 'top-right',
+        });
       },
     },
     mounted(){
@@ -310,6 +315,6 @@ if (window.Vue && window.ElementPlus) {
   ProvidersApp.config.globalProperties.maskKey = maskKey;
   ProvidersApp.config.globalProperties.truncateUrl = truncateUrl;
   ProvidersApp.config.globalProperties.formatTokens = formatTokens;
-  ProvidersApp.config.globalProperties.billingModeLabel = billingModeLabel;
+  ProvidersApp.config.globalProperties.billingModeLabel = (m) => ({none:'不限',request_count:'请求次数',token_count:'Token数量',balance:'余额计费'}[m] || '不限');
   ProvidersApp.mount('#vue-providers');
 }
