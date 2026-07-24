@@ -144,7 +144,7 @@ if (window.Vue && window.ElementPlus) {
       <el-switch v-model="codexForm.nativeResponses" @change="v=>mutexCodex('nativeResponses',v)" />
       <span style="font-size:13px">模型原生支持 Responses 协议（透传，跳过 Responses↔Chat 转换）</span>
     </div>
-    <div class="form-hint" style="margin:0 0 14px 52px">开启后 <code>/openai</code> 端点对该 mapping 不做 Responses↔Chat 双向转换，直接按 <code>openai_url</code> 派生 <code>/responses</code> 原样转发。上方两个"思考过程注入"开关自动关闭、三方互斥。默认关闭。</div>
+    <div class="form-hint" style="margin:0 0 14px 52px">开启后 <code>/openai</code> 端点对该 mapping 不做 Responses↔Chat 双向转换，直接按 <code>openai_url</code> 派生 <code>/responses</code> 原样转发。</div>
 
     <template #footer>
       <el-button @click="dialogCodex=false">取消</el-button>
