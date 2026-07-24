@@ -1,6 +1,6 @@
 # Vibe Coding 服务转发
 
-一个基于 Flask 的多供应商 AI API 代理服务，统一对外暴露 **Anthropic Messages API**、**OpenAI Chat Completions API**、**OpenAI Responses API** 三种接口，底层可对接任意兼容的 LLM 提供商。配套 Web 管理界面，可对提供商、模型映射（含角色映射）、错误码、日志、计费、API Key 等进行可视化配置。
+一个基于 Flask 的多供应商 AI API 代理服务，统一对外暴露 **Anthropic Messages API**、**OpenAI Chat Completions API**、**OpenAI Responses API** 三种接口，底层可对接任意兼容的 LLM 提供商；另内置 MCP 协议端点，可供 AI 客户端远程管理 Nacos 3.x。配套 Web 管理界面，可对提供商、模型映射（含角色映射）、错误码、日志、计费、API Key 等进行可视化配置。
 
 ---
 [软件使用手册](manual/directions/软件使用手册.md)
@@ -22,6 +22,7 @@
 - **自动重试与容错**：请求出错或上游返回 5xx 时自动重试，连接级异常（超时、断开、Chunked 错误）全覆盖；4xx 视为客户端/上游语义错误立即返回不重试。
 - **服务降级与故障转移**：同一别名下某个上游转发失败后，会被临时"降级"一段时间，后续请求自动绕过它、切换到其他健康上游；全部上游都降级时仍会尝试使用，任一上游成功即立即恢复正常。
 - **兼容性强**：自动处理多模态降级（不支持图片的模型替换为占位符）、兼容 dashscope 风格 SSE（无空格）、自动清理 MiniMax 系列无效 `tool_use`、适配 DeepSeek 思考模式等边角情况。
+- **内置 MCP Server**：提供 `/mcp` 端点（MCP Streamable HTTP + JSON-RPC 2.0），让 Claude Code / Codex 等 AI 客户端通过 MCP 协议远程管理 Nacos 3.x 的命名空间与配置，复用现有 API Key 鉴权；详细工具清单与用法见 Web 界面「MCP 广场」Tab。
 
 ---
 
@@ -32,6 +33,7 @@
 - `POST /anthropic/v1/messages`（及子路径）— Anthropic Messages API 透传
 - `POST /v1/chat/completions`（及子路径）— OpenAI Chat Completions 透传
 - `POST /openai/responses` — OpenAI **Responses API** 端点，供 Codex CLI 等只认 Responses 协议的客户端使用；本服务会自动把 Responses 请求转换为 Chat Completions 格式，转发到对应 provider 的 `openai_url`，再把上游的 Chat 响应转回 Responses 格式（同时支持 `stream: true` 的 SSE 与 `stream: false` 的整包返回）
+- `POST /mcp` - MCP（Model Context Protocol）端点，Streamable HTTP 传输 + JSON-RPC 2.0，内置 Nacos 3.x 管理工具（命名空间、配置的 CRUD），供 MCP 客户端远程调用（详见「MCP 广场」）
 - 支持流式响应（`stream: true`）
 - 支持从请求头中读取 `x-api-key` 或 `Authorization: Bearer ...`
 
@@ -57,6 +59,7 @@
   - 别名唯一（仅一条映射）时自然退化为精确匹配
   - 别名重名（多条映射）时按优先级加权轮询，并自动过滤计费超限/未配置对应协议 URL 的 provider
   - 含图片的请求会优先选择池中的多模态成员，无多模态成员时回退到全部成员
+  - 默认按优先级**加权轮询**；也可在「降级设置」中开启**严格优先级（逐级下放）**模式，改为只在最高优先级层内选择，整层降级才下放到更低层（依赖服务降级开关）
 - **模型类型**：标记 `text` / 多模态，便于后续扩展
 - **max_tokens**：可强制覆盖请求的 `max_tokens` 字段（0 = 不覆盖）
 - **角色映射（role_mappings）**：在转发前对请求中的 `messages` 角色进行替换，以 JSON 数组形式配置多条规则
@@ -105,7 +108,7 @@
 
 ### 8. Web 管理界面
 
-`http://localhost:5000/`（默认），登录后包含 6 个 Tab：
+`http://localhost:5000/`（默认），登录后包含 7 个 Tab：
 
 - **提供商管理**：增删改查，表格列含并行（`max_concurrency`）、并发（实时）、Token、调用次数、计费（模式徽章）、状态、完整路径开关等
 - **模型映射**：增删改查，表格列含别名、优先级、目标模型、模型类型、max_tokens、提供商、角色映射（`from→to` 徽章）、状态、降级状态、操作；同名别名以徽章 + 色点 + 行底色做隐式分组（负载均衡池），系统按优先级加权轮询（按客户端 IP 隔离）从候选中选择
@@ -113,8 +116,9 @@
 - **请求日志**：多条件过滤、查看请求/响应详情、清空
 - **API Key**：生成与管理
 - **计费管理**：计费概览 + 单 provider 详细配置
+- **MCP 广场**：展示内置 MCP Server 提供的工具清单与调用说明，含 Nacos 连接参数配置示例（页面内有更详细的介绍）
 
-外加：自动清理设置（保留天数、清理间隔）、使用说明。
+外加：自动清理设置（保留天数、清理间隔）、顶部版本号徽章（自动检测 GitHub 最新版并提示更新）、使用说明。
 
 ### 9. 自动重试与故障转移
 
@@ -122,7 +126,7 @@
 
 **第一层：同一上游的自动重试**
 
-选定一个上游发送请求后，如果失败会在**同一个上游上**再重试最多 3 次（即第一次加上最多 3 次重试，单次转发累计最多发送 4 次请求）：
+选定一个上游发送请求后，如果失败会在**同一个上游上**自动重试（默认最多再重试 3 次，即第一次加上最多 3 次重试，单次转发累计最多发送 4 次请求；**重试次数与重试间隔均可在「降级设置」中配置，默认间隔 1 秒**，运行中修改无需重启）：
 
 - 主要应对偶发的网络抖动或上游临时不可用（连接超时、上游断开、HTTP 5xx 等）
 - 客户端或上游语义错误（4xx，如 401/403/404）不会重试，立即返回
@@ -206,6 +210,7 @@ python app.py
   Anthropic 代理: http://localhost:5000/anthropic
   OpenAI 代理:    http://localhost:5000/v1
   Responses 代理: http://localhost:5000/openai
+  MCP / Nacos:    http://localhost:5000/mcp
 ==================================================
 ```
 
@@ -395,11 +400,14 @@ curl -X POST http://localhost:5000/openai/responses \
 
 ### 10. 故障转移配置
 
-进入 **模型映射** Tab → 表格上方有一行降级控制条：
+进入 **模型映射** Tab → 点击表格上方的 **「降级设置」** 按钮打开配置弹窗：
 
 - **启用服务降级**（开关）：打开后，转发失败的上游会被临时"降级"，后续请求自动绕过它、切换到其他健康上游
-- **降级持续（秒）**（数字输入框，默认 30，最小 1）：失败上游被降级的持续时长
-- **保存设置**：保存后立即生效
+- **严格优先级**（开关，依赖"启用服务降级"）：开启后只在当前最高优先级层内选择候选，只有整层都被降级时才下放到更低优先级层；关闭时（默认）保持原有的按优先级加权轮询
+- **降级持续秒数**（数字输入框，默认 30，最小 1）：失败上游被降级的持续时长
+- **转发重试次数**（数字输入框，默认 3，最小 0）：单次转发失败后最多再重试的次数（0 = 不重试）
+- **重试间隔秒数**（数字输入框，默认 1.0，步长 0.5）：两次重试之间的等待时间
+- **保存设置**：保存后立即生效，运行中修改无需重启
 
 降级开启后的效果：
 
@@ -422,12 +430,15 @@ ai-api-proxy/
 ├── app.py              # Flask 入口、路由、认证中间件、后台任务
 ├── config.py           # SQLite 封装、表迁移、所有数据库操作
 ├── proxy.py            # 核心代理逻辑（路由、并发、流式、角色映射、重试、多模态降级等）
+├── mcp_server.py       # MCP 协议层（JSON-RPC 2.0 解析、工具注册与分发）
+├── nacos_client.py     # Nacos 3.x Console API 封装（命名空间/配置 CRUD）
+├── version.py          # 应用版本号（单一来源）
 ├── requirements.txt    # 依赖
 ├── proxy.db            # SQLite 数据库（自动创建，已 gitignore）
 ├── templates/
-│   ├── index.html      # 管理界面 SPA
+│   ├── index.html      # 管理界面 SPA（Vue 3 + Element Plus 组件岛屿）
 │   └── login.html      # 登录页
-└── static/lib/         # 前端依赖
+└── static/             # 前端资源（Vue / Element Plus 等 vendored 依赖 + 各面板脚本）
 ```
 
 ---
